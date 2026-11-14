@@ -1,4 +1,5 @@
 import type { Register, EngineInterface } from 'claude-code'
+import { decide, MARK, MODES, parseMode, type Human, type Mode } from './forward.js'
 
 // ВК-мост для одной сессии Claude Code.
 // Хаб (hub/vk_hub.py) держит связь с ВК и раскладывает сообщения по сессиям,
@@ -6,17 +7,18 @@ import type { Register, EngineInterface } from 'claude-code'
 
 const HUB = 'http://127.0.0.1:8765'
 const HEADERS = { 'X-VK-Hub': '1', 'Content-Type': 'application/json' }
-const MARK = '[ВК] '
 const TOOL_BRIDGE = 'mcp__vk-bridge__vk_bridge'
 const TOOL_SEND = 'mcp__vk-bridge__vk_send'
 
-type Saved = { enabled: boolean; label: string; rules: string }
+type Saved = { enabled: boolean; label: string; rules: string; mode?: Mode }
 
 let sid = ''
 let cwd = ''
 let enabled = false
 let label = ''
 let rules = ''
+let mode: Mode = 'answers'
+let lastHuman: Human
 let registered = false
 let inflight = false
 let busy = false
@@ -37,9 +39,10 @@ function contextNote(): string {
   return [
     `ВК-мост включён для этой сессии, метка «${label}». Владелец моста может быть не у компьютера и читает ответы в ВК.`,
     `Сообщения, которые начинаются с «${MARK.trim()}», владелец моста прислал из ВК. Итоговый ответ хода, начатого таким сообщением, уйдёт ему в ВК автоматически, пиши его коротко и по делу.`,
+    `Режим автоотправки «${mode}»: ${MODES[mode]}. Ходы, начатые с клавиатуры, и ответы на обратную связь хуков в ВК не уходят.`,
     'Промежуточные сообщения (статус, вопрос, просьба принять решение) отправляй инструментом vk_send.',
     'AskUserQuestion при включённом мосте не работает. Вопрос задавай через vk_send с пронумерованными вариантами и заканчивай ход, ответ придёт сообщением из ВК.',
-    'Сменить метку, правила отчёта или выключить мост можно инструментом vk_bridge.',
+    'Сменить метку, правила отчёта, режим или выключить мост можно инструментом vk_bridge. Если правила ограничивают сообщения (например «только при проблемах»), поставь режим quiet.',
     rules ? `Правила отчёта от владельца: ${rules}` : 'Особых правил отчёта не задано.',
   ].join('\n')
 }
@@ -120,7 +123,7 @@ async function registerBridge($: EngineInterface, quiet: boolean): Promise<boole
 }
 
 async function save($: EngineInterface): Promise<void> {
-  const value: Saved = { enabled, label, rules }
+  const value: Saved = { enabled, label, rules, mode }
   await $.store.set('bridge:' + sid, value)
 }
 
@@ -168,18 +171,19 @@ async function disable($: EngineInterface, note: string, forget: boolean): Promi
   return 'ВК-мост выключен.'
 }
 
-async function update($: EngineInterface, newLabel: string | undefined, newRules: string | undefined): Promise<string> {
+async function update($: EngineInterface, newLabel: string | undefined, newRules: string | undefined, newMode?: Mode): Promise<string> {
   if (newLabel) label = newLabel
   if (newRules !== undefined) rules = newRules
+  if (newMode) mode = newMode
   if (enabled) await registerBridge($, true)
   await save($)
   showStatus($)
-  return `Метка «${label}». Правила отчёта: ${rules || 'не заданы'}.`
+  return `Метка «${label}». Режим «${mode}», ${MODES[mode]}. Правила отчёта: ${rules || 'не заданы'}.`
 }
 
 function statusText(): string {
   return enabled
-    ? `ВК-мост включён, метка «${label}», ${registered ? 'хаб на связи' : 'хаб не отвечает'}. Правила отчёта: ${rules || 'не заданы'}.`
+    ? `ВК-мост включён, метка «${label}», ${registered ? 'хаб на связи' : 'хаб не отвечает'}. Режим «${mode}», ${MODES[mode]}. Правила отчёта: ${rules || 'не заданы'}.`
     : 'ВК-мост выключен.'
 }
 
@@ -258,6 +262,7 @@ export const register: Register = on => {
     if (saved) {
       label = saved.label || label
       rules = saved.rules || ''
+      mode = saved.mode ?? 'answers'
     }
 
     await $.tool.register({
@@ -267,13 +272,17 @@ export const register: Register = on => {
         'Используй, когда пользователь просит включить или выключить ВК-мост (мост, ВК, VK), сменить метку сессии ' +
         'или задать правила отчёта (например «пиши о статусе после каждого этапа»). ' +
         'action: on, off, status, set. label задаёт метку, под которой сессия видна в ВК (например «Проект А · Задание 2»). ' +
-        'rules заменяет правила отчёта целиком, пустая строка их стирает.',
+        'rules заменяет правила отчёта целиком, пустая строка их стирает. ' +
+        'mode задаёт, что уходит в ВК само: answers (по умолчанию) ответы на сообщения из ВК и итоги работы, запрошенной из ВК; ' +
+        'quiet только ответы на сообщения из ВК, остальное агент шлёт сам через vk_send (режим «только тревоги»); all итог каждого хода, начатого не с клавиатуры. ' +
+        'Если пользователь просит писать только при проблемах или реже, ставь quiet.',
       inputSchema: {
         type: 'object',
         properties: {
           action: { type: 'string', enum: ['on', 'off', 'status', 'set'] },
           label: { type: 'string', description: 'Метка сессии в ВК' },
           rules: { type: 'string', description: 'Правила отчёта целиком' },
+          mode: { type: 'string', enum: ['answers', 'quiet', 'all'], description: 'Что уходит в ВК автоматически' },
         },
         required: ['action'],
       },
@@ -294,8 +303,8 @@ export const register: Register = on => {
     try {
       await $.command.register({
         name: 'vk',
-        description: 'ВК-мост этой сессии: on, off, status, label <метка>, rules <правила>',
-        argumentHint: 'on|off|status|label|rules',
+        description: 'ВК-мост этой сессии: on, off, status, label <метка>, rules <правила>, mode answers|quiet|all',
+        argumentHint: 'on|off|status|label|rules|mode',
         immediate: true,
       })
     } catch (err) {
@@ -341,17 +350,23 @@ export const register: Register = on => {
         return { text: await update($, tail || undefined, undefined) }
       case 'rules':
         return { text: await update($, undefined, tail === 'clear' ? '' : tail) }
+      case 'mode': {
+        const m = parseMode(tail.toLowerCase())
+        return { text: m ? await update($, undefined, undefined, m) : 'Режимы: answers, quiet, all. Сейчас «' + mode + '».' }
+      }
       default:
         return { text: statusText() }
     }
   })
 
   on('tool.call', { tool: TOOL_BRIDGE }, async ($, e) => {
-    const input = e as unknown as { action: string; label?: string; rules?: string }
+    const input = e as unknown as { action: string; label?: string; rules?: string; mode?: string }
     let text: string
+    const newMode = parseMode(input.mode)
+    if (newMode) mode = newMode
     if (input.action === 'on') text = await enable($, input.label, input.rules)
     else if (input.action === 'off') text = await disable($, '⏹ мост выключен', true)
-    else if (input.action === 'set') text = await update($, input.label, input.rules)
+    else if (input.action === 'set') text = await update($, input.label, input.rules, newMode)
     else text = statusText()
     return { result: text }
   })
@@ -382,10 +397,9 @@ export const register: Register = on => {
       busy = true
       busyNoted = false
       currentTurn = e.turnId
-      // В ВК уходит итог каждого хода, начатого не с клавиатуры: сообщения из ВК,
-      // завершения фоновых задач, таймеры, сообщения других сессий.
-      const local = lastOrigin === 'composer' || lastOrigin === 'auto-continuation'
-      if (e.text.startsWith(MARK) || !local) vkTurns.add(e.turnId)
+      const d = decide(e.text, lastOrigin, mode, lastHuman)
+      lastHuman = d.lastHuman
+      if (d.forward) vkTurns.add(e.turnId)
       lastOrigin = undefined
     }
     return next(e)
