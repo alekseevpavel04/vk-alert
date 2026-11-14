@@ -1,0 +1,4 @@
+{
+  "description": "vk-bridge hooks module",
+  "modules": ["./register.ts"]
+}

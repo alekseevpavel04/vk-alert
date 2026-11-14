@@ -1,0 +1,9 @@
+{
+  "name": "vk-bridge",
+  "version": "0.1.0",
+  "description": "ВК-мост: сообщения из диалога с сообществом ВК будят эту сессию, ответы агента уходят обратно в ВК",
+  "author": { "name": "alekseevpavel04" },
+  "homepage": "https://github.com/alekseevpavel04/vk-alert",
+  "repository": "https://github.com/alekseevpavel04/vk-alert",
+  "license": "MIT"
+}
