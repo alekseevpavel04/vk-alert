@@ -1,140 +1,223 @@
-"""Stub-mode tests for vk-hub: run with  python tests/test_hub.py"""
+"""vk-hub tests, stub mode, isolated data dir:  python tests/test_hub.py"""
+import importlib.util
 import json
 import os
 import subprocess
 import sys
+import tempfile
+import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PORT = 8799
-BASE = f"http://127.0.0.1:{PORT}"
+DATA = Path(tempfile.mkdtemp(prefix="vkhub-test-"))
+ENV = dict(os.environ, VK_STUB="1", HUB_PORT=str(PORT), VK_OWNER_ID="1", VK_GROUP_ID="5",
+           VK_TOKEN="", VK_HUB_DATA=str(DATA))
+os.environ.update({k: ENV[k] for k in ("HUB_PORT", "VK_OWNER_ID", "VK_GROUP_ID", "VK_TOKEN", "VK_HUB_DATA")})
+
+spec = importlib.util.spec_from_file_location("vk_hub", ROOT / "hub" / "vk_hub.py")
+hub = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hub)
+
+RESULTS = []
 
 
-def call(method, path, body=None, headers=None):
-    h = {"X-VK-Hub": "1", "Content-Type": "application/json"}
-    h.update(headers or {})
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(BASE + path, data=data, headers=h, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return r.status, json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read().decode())
+def check(name, cond, detail=""):
+    RESULTS.append((name, bool(cond)))
+    print(("ok   " if cond else "FAIL ") + name + ("" if cond else f"  {detail}"))
+
+
+def call(path, body=None):
+    return hub.signed_request(path, body)
 
 
 def out(since=0):
-    return call("GET", f"/stub/out?since={since}")[1]["messages"]
+    return call(f"/stub/out?since={since}")[1]["messages"]
 
 
 ACKS = {}
 
 
 def inbox(sid, wait=0):
-    """Poll like the mod does: take new items, acknowledge them on the next poll."""
-    r = call("GET", f"/inbox?sid={sid}&wait={wait}&ack={ACKS.get(sid, 0)}")[1]
+    r = call(f"/inbox?sid={sid}&wait={wait}&ack={ACKS.get(sid, 0)}")[1]
     for m in r.get("messages", []):
         ACKS[sid] = max(ACKS.get(sid, 0), m["id"])
     return r
 
 
-def main():
-    env = dict(os.environ, VK_STUB="1", HUB_PORT=str(PORT), VK_OWNER_ID="1", VK_TOKEN="")
-    proc = subprocess.Popen([sys.executable, str(ROOT / "hub" / "vk_hub.py")], env=env)
-    ok = 0
+def say(text, **kw):
+    return call("/stub/in", dict(kw, text=text))
+
+
+def last():
+    return out()[-1]["text"]
+
+
+def unit_tests():
+    # markdown -> plain text
+    md = "## Итог\n\n**Готово**, тесты `pytest` проходят.\n- пункт\n| a | b |\n|---|---|\n| 1 | 2 |\n[док](http://x.y)\n```py\nprint(1)\n```"
+    p = hub.plain(md)
+    check("plain: заголовок, жирный, код, список", p.startswith("Итог\n\nГотово, тесты pytest проходят.\n• пункт"), p)
+    check("plain: таблица и ссылка", "a · b\n1 · 2\nдок (http://x.y)\nprint(1)" in p, p)
+    check("plain: snake_case не трогает", hub.plain("файл my_var_name.py") == "файл my_var_name.py")
+    # chunks in UTF-16 units, no split surrogates
+    parts = hub.chunks("😀" * 5000, 3900)
+    check("chunks: эмодзи по UTF-16", all(hub.units(x) <= 3900 for x in parts) and "".join(parts) == "😀" * 5000,
+          [hub.units(x) for x in parts])
+    words = hub.chunks(("слово " * 2000).strip(), 3900)
+    check("chunks: режет по словам", all(not x.startswith("ово") for x in words))
+    # labels
+    check("label: пробелы и длина", hub.norm_label("Проект А · Задание номер 2") == "Проект-А-Задание")
+    check("label: пустая", hub.norm_label("  ") == "сессия")
+    # redact
+    leaks = ["sk-ant-api03-abcdefghijklmnop", "sk-proj-abcdefghijklmnopqrstuvwx", "AIza" + "B" * 35,
+             "postgres://user:hunter2pass@db:5432/x", '{"api_key": "abcd1234efgh"}',
+             "Authorization: Bearer abcdefghijklmnop123456", "123456789:" + "A" * 35, "token=abcdef123456"]
+    bad = [s for s in leaks if any(part in hub.redact(s) for part in ("abcdefghijklmnop", "hunter2pass", "abcd1234efgh", "B" * 35, "A" * 35, "abcdef123456"))]
+    check("redact: ловит секреты", not bad, bad)
+    safe = ["max_tokens=200000", "tokenizer: bert-base-uncased", "token count = 5", "tokens_used: 123456",
+            "secret_santa", "файл my_var_name.py"]
+    changed = [s for s in safe if hub.redact(s) != s]
+    check("redact: не трогает обычный текст", not changed, changed)
+    check("stop: пунктуация и регистр", all(hub.is_stop(s) for s in ("стоп", "Стоп!", "СТОП.", "stop ", "стоп…")))
+
+
+def live_tests():
+    proc = subprocess.Popen([sys.executable, str(ROOT / "hub" / "vk_hub.py")], env=ENV)
     try:
         for _ in range(50):
             try:
-                call("GET", "/health")
+                call("/health")
                 break
             except Exception:
                 time.sleep(0.1)
 
-        # guard: no header, or a browser Origin -> 403
-        req = urllib.request.Request(BASE + "/health")
-        try:
-            urllib.request.urlopen(req)
-            raise AssertionError("no header must be refused")
-        except urllib.error.HTTPError as e:
-            assert e.code == 403
-        assert call("GET", "/health", headers={"Origin": "http://evil"})[0] == 403
-        ok += 1
+        # exclusive bind: a second hub exits
+        second = subprocess.Popen([sys.executable, str(ROOT / "hub" / "vk_hub.py")], env=ENV)
+        check("второй хаб не занимает порт", second.wait(timeout=10) == 0)
 
-        # no bridges
-        call("POST", "/stub/in", {"text": "привет"})
-        assert "Нет включённых мостов" in out()[-1]["text"]
-        ok += 1
+        # auth
+        def raw_get(headers):
+            req = urllib.request.Request(f"http://127.0.0.1:{PORT}/health", headers=headers)
+            try:
+                return urllib.request.urlopen(req).status
+            except urllib.error.HTTPError as e:
+                return e.code
+        check("без подписи 403", raw_get({}) == 403)
+        ts = str(int(time.time()))
+        good = ts + "." + hub.sign("req", "GET", "/health", ts, hub.sha(b""))
+        check("подпись проходит", raw_get({"X-VK-Hub-Auth": good}) == 200)
+        check("чужой Host 403", raw_get({"X-VK-Hub-Auth": good, "Host": "evil.example:8799"}) == 403)
+        check("Origin 403", raw_get({"X-VK-Hub-Auth": good, "Origin": "http://evil"}) == 403)
+        old = "100." + hub.sign("req", "GET", "/health", "100", hub.sha(b""))
+        check("старая подпись 403", raw_get({"X-VK-Hub-Auth": old}) == 403)
 
-        # one bridge: plain text goes to it
-        assert call("POST", "/bridge/on", {"sid": "s1", "label": "A · Задание 2", "cwd": "D:/A"})[1]["label"] == "A · Задание 2"
-        assert out()[-1]["text"] == "[A · Задание 2] 🔌 мост включён"
-        call("POST", "/stub/in", {"text": "сделай X"})
-        assert inbox("s1")["messages"][0]["text"] == "сделай X"
-        ok += 1
+        say("привет")
+        check("нет мостов", "Нет включённых мостов" in last(), last())
 
-        # agent message, then a second bridge with a duplicate label
-        call("POST", "/send", {"sid": "s1", "text": "готово, token=abcdef123456"})
-        last = out()[-1]
-        assert last["text"] == "[A · Задание 2] готово, token=[REDACTED]", last
-        a_msg = last["id"]
-        assert call("POST", "/bridge/on", {"sid": "s2", "label": "A · Задание 2"})[1]["label"] == "A · Задание 2 2"
-        call("POST", "/bridge/on", {"sid": "s2", "label": "Проект 2", "quiet": True})
-        ok += 1
+        call("/bridge/on", {"sid": "s1", "label": "shopper", "cwd": "D:/shopper"})
+        check("включение, служебная строка", last() == "shopper · мост включён", last())
+        say("сделай X")
+        check("один мост, без адреса", inbox("s1")["messages"][0]["text"] == "сделай X")
 
-        # two bridges: reply routes, #label routes, plain text asks
-        call("POST", "/stub/in", {"text": "ещё", "reply_to": a_msg})
-        assert inbox("s1")["messages"][0]["text"] == "ещё"
-        call("POST", "/stub/in", {"text": "#проект привет"})
-        assert inbox("s2")["messages"][0]["text"] == "привет"
-        call("POST", "/stub/in", {"text": "кому это?"})
+        call("/send", {"sid": "s1", "text": "**Готово**, token=abcdef123456"})
+        m = out()[-1]
+        check("ответ: шапка, без markdown, секрет скрыт", m["text"] == "shopper\nГотово, token=[REDACTED]", m["text"])
+        a_msg = m["id"]
+        call("/send", {"sid": "s1", "text": "Прод упал", "kind": "alert"})
+        check("тревога заметная", last() == "‼️ ПРОБЛЕМА · shopper\nПрод упал", last())
+        status, res = call("/send", {"sid": "s1", "text": "x", "kind": "loud"})
+        check("неизвестный kind 400", status == 400)
+
+        call("/bridge/on", {"sid": "s2", "label": "shopper", "quiet": True})
+        check("дубль метки", call("/health")[1]["bridges"][1]["label"] == "shopper-2")
+        call("/bridge/on", {"sid": "s2", "label": "ltt 2", "quiet": True})
+
+        say("ещё", reply_to=a_msg)
+        check("ответ на сообщение агента", inbox("s1")["messages"][0]["text"] == "ещё")
+        say("#ltt привет")
+        check("#метка по началу", inbox("s2")["messages"][0]["text"] == "привет")
+        say("#ltt-2 и так")
+        check("#метка целиком", inbox("s2")["messages"][0]["text"] == "и так")
+        say("#нету привет")
+        check("#неизвестная метка не уходит другим", "Нет моста «нету»" in last() and not inbox("s1")["messages"])
+        say("#ltt")
+        check("#метка без текста", "нужен текст" in last(), last())
+
+        say("кому это?")
         ask = out()[-1]
-        assert ask["text"].startswith("Кому отправить") and len(ask["keyboard"]["buttons"]) == 2
+        check("без адреса кнопки", ask["text"].startswith("Кому отправить") and len(ask["keyboard"]["buttons"]) == 2)
         payload = ask["keyboard"]["buttons"][1][0]["action"]["payload"]
-        call("POST", "/stub/in", {"text": "Проект 2", "payload": payload})
-        assert inbox("s2")["messages"][0]["text"] == "кому это?"
-        ok += 1
+        say("ltt-2", payload=payload)
+        check("кнопка доставляет", inbox("s2")["messages"][0]["text"] == "кому это?")
+        say("ltt-2", payload=payload)
+        check("повторная кнопка", "устарело" in last())
 
-        # stop and off
-        call("POST", "/stub/in", {"text": "стоп", "reply_to": a_msg})
-        assert inbox("s1")["messages"][0]["kind"] == "stop"
-        call("POST", "/stub/in", {"text": "/off all"})
-        assert inbox("s1")["messages"][0]["kind"] == "off" and inbox("s2")["messages"][0]["kind"] == "off"
-        ok += 1
+        # reply to a session that is gone
+        call("/send", {"sid": "s2", "text": "я ltt"})
+        ltt_msg = out()[-1]["id"]
+        call("/bridge/off", {"sid": "s2", "note": "сессия закрыта"})
+        check("закрытие, служебная строка", last() == "ltt-2 · сессия закрыта", last())
+        say("удали build", reply_to=ltt_msg)
+        check("ответ отключённой сессии не уходит другой",
+              "уже отключилась" in last() and not inbox("s1")["messages"], last())
+
+        # attachments
+        say("", attachments=[{"type": "sticker"}])
+        check("стикер без текста", "только текст" in last(), last())
+        say("смотри", attachments=[{"type": "photo"}])
+        check("фото с подписью: текст дошёл", inbox("s1")["messages"][0]["text"] == "смотри" and "вложения" in last())
+
+        # stop
+        say("Стоп!")
+        check("Стоп! это stop", inbox("s1")["messages"][0]["kind"] == "stop")
+        call("/bridge/on", {"sid": "s3", "label": "aux", "quiet": True})
+        call(f"/inbox?sid=s1&wait=0&busy=1&ack={ACKS.get('s1', 0)}")
+        say("стоп")
+        check("стоп без адреса бьёт занятых", inbox("s1")["messages"][0]["kind"] == "stop" and not inbox("s3")["messages"])
+
+        # /off
+        say("/offline")
+        check("/offline не команда", "Кому отправить" in last(), last())
+        say("/off all")
+        check("/off all", inbox("s1")["messages"][-1]["kind"] == "off" and inbox("s3")["messages"][-1]["kind"] == "off")
 
         # long poll wakes on delivery
+        call("/bridge/off", {"sid": "s3"})
         t0 = time.time()
-        import threading
-        threading.Timer(0.5, lambda: call("POST", "/stub/in", {"text": "#проект пинг"})).start()
-        got = inbox("s2", wait=5)
-        assert got["messages"][0]["text"] == "пинг" and time.time() - t0 < 2
-        ok += 1
+        threading.Timer(0.5, lambda: say("пинг")).start()
+        got = inbox("s1", wait=5)
+        check("long poll будит", got["messages"][0]["text"] == "пинг" and time.time() - t0 < 2)
 
-        # chunking and list
-        call("POST", "/send", {"sid": "s2", "text": "x" * 9000})
-        assert len([m for m in out() if m["text"].startswith("[Проект 2] xxx") or set(m["text"]) == {"x"}]) == 3
-        call("POST", "/stub/in", {"text": "/list"})
-        assert "Проект 2" in out()[-1]["text"]
-        ok += 1
+        # chunks with headers
+        before = out()[-1]["id"]
+        call("/send", {"sid": "s1", "text": "x" * 9000})
+        parts = out(before + 1)
+        check("длинный ответ частями с шапкой",
+              len(parts) == 3 and all(p["text"].startswith(f"shopper ({i}/3)\n") for i, p in enumerate(parts, 1)),
+              [p["text"][:20] for p in parts])
 
-        # off, unknown sid after off
-        call("POST", "/bridge/off", {"sid": "s1", "note": "⏹ мост выключен"})
-        assert out()[-1]["text"] == "[A · Задание 2] ⏹ мост выключен"
-        assert inbox("s1")["known"] is False
-        ok += 1
-        # unacknowledged items are delivered again (mod died mid-poll)
-        call("POST", "/bridge/on", {"sid": "s3", "label": "R"})
-        call("POST", "/stub/in", {"text": "#R раз"})
-        first = call("GET", "/inbox?sid=s3&wait=0&ack=0")[1]["messages"]
-        again = call("GET", "/inbox?sid=s3&wait=0&ack=0")[1]["messages"]
-        assert [m["text"] for m in again] == ["раз"] and again[0]["id"] == first[0]["id"]
-        gone = call("GET", f"/inbox?sid=s3&wait=0&ack={first[0]['id']}")[1]["messages"]
-        assert gone == []
-        ok += 1
-        print(f"OK {ok}/10")
+        # unacknowledged items are delivered again
+        call("/bridge/on", {"sid": "s4", "label": "R", "quiet": True})
+        say("#R раз")
+        first = call("/inbox?sid=s4&wait=0&ack=0")[1]["messages"]
+        again = call("/inbox?sid=s4&wait=0&ack=0")[1]["messages"]
+        gone = call(f"/inbox?sid=s4&wait=0&ack={first[0]['id']}")[1]["messages"]
+        check("без подтверждения приходит снова", again[0]["id"] == first[0]["id"] and gone == [])
+        check("плохой ack 400", call("/inbox?sid=s4&ack=abc")[0] == 400)
+
+        call("/bridge/off", {"sid": "s1"})
+        check("после выключения sid неизвестен", inbox("s1")["known"] is False)
     finally:
         proc.terminate()
 
 
 if __name__ == "__main__":
-    main()
+    unit_tests()
+    live_tests()
+    bad = [n for n, ok in RESULTS if not ok]
+    print(f"\n{len(RESULTS) - len(bad)}/{len(RESULTS)} ok")
+    sys.exit(1 if bad else 0)

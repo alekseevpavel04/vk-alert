@@ -1,16 +1,20 @@
 import type { Register, EngineInterface } from 'claude-code'
 import { decide, MARK, MODES, parseMode, type Human, type Mode } from './forward.js'
+import { enc, hex, hmacHex, sha256 } from './crypto.js'
 
 // ВК-мост для одной сессии Claude Code.
 // Хаб (hub/vk_hub.py) держит связь с ВК и раскладывает сообщения по сессиям,
 // этот мод забирает сообщения своей сессии, будит агента и отправляет ответы.
+// Каждый запрос к хабу подписан ключом из data/hub.key, каждый ответ хаба тоже,
+// поэтому чужой процесс на порту хаба не может подсунуть сессии текст.
 
-const HUB = 'http://127.0.0.1:8765'
-const HEADERS = { 'X-VK-Hub': '1', 'Content-Type': 'application/json' }
 const TOOL_BRIDGE = 'mcp__vk-bridge__vk_bridge'
 const TOOL_SEND = 'mcp__vk-bridge__vk_send'
+const LABEL_MAX = 16
 
-type Saved = { enabled: boolean; label: string; rules: string; mode?: Mode }
+type Saved = { enabled: boolean; label: string; rules: string; mode?: Mode; at?: number }
+type Kind = 'reply' | 'service' | 'alert'
+type Item = { id: number; kind: string; text: string }
 
 let sid = ''
 let cwd = ''
@@ -19,78 +23,132 @@ let label = ''
 let rules = ''
 let mode: Mode = 'answers'
 let lastHuman: Human
+let lastOrigin: string | undefined
 let registered = false
 let inflight = false
 let busy = false
 let currentTurn: string | undefined
+let turnStartedAt = 0
 let busyNoted = false
+let stoppedByVk: string | undefined
 const vkTurns = new Set<string>()
 let lastSpawn = 0
+let lastRetry = 0
 let pending: string[] = []
-let lastOrigin: string | undefined
 let acked = 0
+let noteSent = ''
+let hubKey: Uint8Array | undefined
+let hubUrl = ''
+
+// ---------------------------------------------------------------- helpers
 
 function baseName(path: string): string {
   const parts = path.replace(/\\/g, '/').split('/').filter(Boolean)
   return parts[parts.length - 1] ?? 'сессия'
 }
 
+function shortLabel(text: string): string {
+  const s = text.trim().replace(/\s+/g, '-').replace(/[^\p{L}\p{N}_.\-]/gu, '').replace(/-{2,}/g, '-')
+  return s.slice(0, LABEL_MAX).replace(/^[-.]+|[-.]+$/g, '') || 'сессия'
+}
+
 function contextNote(): string {
   return [
     `ВК-мост включён для этой сессии, метка «${label}». Владелец моста может быть не у компьютера и читает ответы в ВК.`,
-    `Сообщения, которые начинаются с «${MARK.trim()}», владелец моста прислал из ВК. Итоговый ответ хода, начатого таким сообщением, уйдёт ему в ВК автоматически, пиши его коротко и по делу.`,
+    `Сообщения, которые начинаются с «${MARK.trim()}», владелец прислал из ВК. Итоговый ответ хода, начатого таким сообщением, уйдёт ему в ВК автоматически, пиши его коротко и по делу, без таблиц.`,
     `Режим автоотправки «${mode}»: ${MODES[mode]}. Ходы, начатые с клавиатуры, и ответы на обратную связь хуков в ВК не уходят.`,
-    'Промежуточные сообщения (статус, вопрос, просьба принять решение) отправляй инструментом vk_send.',
+    'Промежуточные сообщения (статус, вопрос, просьба принять решение) отправляй инструментом vk_send. level alert ставь только при реальной проблеме, когда без владельца нельзя продолжать или есть риск потерять данные, деньги или доступ. Всё остальное обычным уровнем.',
     'AskUserQuestion при включённом мосте не работает. Вопрос задавай через vk_send с пронумерованными вариантами и заканчивай ход, ответ придёт сообщением из ВК.',
     'Сменить метку, правила отчёта, режим или выключить мост можно инструментом vk_bridge. Если правила ограничивают сообщения (например «только при проблемах»), поставь режим quiet.',
     rules ? `Правила отчёта от владельца: ${rules}` : 'Особых правил отчёта не задано.',
   ].join('\n')
 }
 
-async function hubPost($: EngineInterface, path: string, body: unknown): Promise<any> {
-  const r = await $.http.fetch(HUB + path, { method: 'POST', headers: HEADERS, body: JSON.stringify(body) })
-  return r.ok ? JSON.parse(r.text) : { ok: false, status: r.status }
-}
-
-async function hubAlive($: EngineInterface): Promise<boolean> {
-  try {
-    const r = await $.http.fetch(HUB + '/health', { headers: HEADERS })
-    return r.ok
-  } catch {
-    return false
-  }
-}
+// ---------------------------------------------------------------- hub access
 
 async function hubHome($: EngineInterface): Promise<string> {
   const near = $.plugin.root.replace(/\\/g, '/').replace(/\/plugin\/?$/, '')
   if (await $.fs.exists(near + '/hub/vk_hub.py')) return near
   const fromEnv = await $.env.get('VK_ALERT_HOME')
-  if (fromEnv) return fromEnv.replace(/\\/g, '/')
-  return near
+  return fromEnv ? fromEnv.replace(/\\/g, '/') : near
+}
+
+async function readText($: EngineInterface, path: string): Promise<string> {
+  try {
+    return String(await $.fs.read(path))
+  } catch {
+    return ''
+  }
+}
+
+// Ключ и порт пишет хаб при старте в data/. Читаем их заново, если запрос не прошёл.
+async function loadHub($: EngineInterface): Promise<boolean> {
+  const home = await hubHome($)
+  const key = (await readText($, home + '/data/hub.key')).trim()
+  if (!/^[0-9a-f]{64}$/.test(key)) return false
+  hubKey = Uint8Array.from(key.match(/../g)!.map(x => parseInt(x, 16)))
+  let port = (await readText($, home + '/data/hub.port')).trim()
+  if (!/^\d+$/.test(port)) port = /^HUB_PORT=(\d+)/m.exec(await readText($, home + '/.env'))?.[1] ?? '8765'
+  hubUrl = 'http://127.0.0.1:' + port
+  return true
+}
+
+async function hubFetch($: EngineInterface, path: string, body?: unknown): Promise<any> {
+  if (!hubKey && !(await loadHub($))) throw new Error('хаб ещё не запускался')
+  const key = hubKey!
+  const method = body === undefined ? 'GET' : 'POST'
+  const raw = body === undefined ? '' : JSON.stringify(body)
+  const ts = String(Math.floor(Date.now() / 1000))
+  const auth = ts + '.' + (await hmacHex(key, ['req', method, path, ts, hex(await sha256(enc.encode(raw)))].join('\n')))
+  const r = await $.http.fetch(hubUrl + path, {
+    method,
+    headers: { 'X-VK-Hub-Auth': auth, 'Content-Type': 'application/json' },
+    body: method === 'POST' ? raw : undefined,
+  })
+  const sig = Object.entries(r.headers).find(([k]) => k.toLowerCase() === 'x-vk-hub-sig')?.[1] ?? ''
+  const want = await hmacHex(key, ['resp', auth, hex(await sha256(enc.encode(r.text)))].join('\n'))
+  if (sig !== want) {
+    hubKey = undefined
+    throw new Error(r.status === 403 ? 'хаб отклонил подпись' : 'ответ не от нашего хаба')
+  }
+  return { status: r.status, ...(JSON.parse(r.text || '{}') as object) }
+}
+
+async function hubAlive($: EngineInterface): Promise<boolean> {
+  try {
+    return (await hubFetch($, '/health')).status === 200
+  } catch {
+    return false
+  }
 }
 
 // Запускает хаб отдельным процессом, чтобы он не умирал вместе с этой сессией.
-// Windows через WMI, macOS и Linux через nohup с отдельной сессией процесса.
+// Второй хаб не страшен: он не сможет занять порт и сразу выйдет.
 async function spawnHub($: EngineInterface): Promise<void> {
+  if (Date.now() - lastSpawn < 15000) return
   lastSpawn = Date.now()
   const home = await hubHome($)
-  if (!/^[A-Za-z]:/.test(home)) {
-    const sh = `cd "${home}" && (command -v setsid >/dev/null && setsid nohup python3 hub/vk_hub.py >/dev/null 2>&1 || nohup python3 hub/vk_hub.py >/dev/null 2>&1) &`
+  if (!/^[A-Za-z]:/.test(home) && !home.startsWith('//')) {
+    const sh = 'cd "$1" && (command -v setsid >/dev/null && setsid nohup python3 hub/vk_hub.py || nohup python3 hub/vk_hub.py) >/dev/null 2>&1 </dev/null &'
     try {
-      await $.process.run(['sh', '-c', sh], { timeoutMs: 20000 })
+      await $.process.run(['sh', '-c', sh, 'sh', home], { timeoutMs: 20000 })
     } catch (err) {
       $.ui.log('не удалось запустить хаб: ' + String(err))
     }
     return
   }
-  const win = home.replace(/\//g, '\\')
-  // WMI не видит пользовательский PATH, поэтому нужен полный путь к pythonw
+  // Windows: через WMI, чтобы хаб не попал в job-объект сессии. Путь идёт через переменную окружения,
+  // поэтому апостроф или кавычка в пути не ломают команду. WMI не видит пользовательский PATH.
   const ps =
-    `$py = (Get-Command pythonw -ErrorAction SilentlyContinue).Source; if (-not $py) { exit 3 }; ` +
-    `$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=('"' + $py + '" "${win}\\hub\\vk_hub.py"'); CurrentDirectory='${win}'}; ` +
-    `exit $r.ReturnValue`
+    "$py = (Get-Command pythonw, pyw -ErrorAction SilentlyContinue | Select-Object -First 1).Source; if (-not $py) { exit 3 }; " +
+    "$h = $env:VK_HUB_HOME; " +
+    "$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=('\"' + $py + '\" \"' + $h + '\\hub\\vk_hub.py\"'); CurrentDirectory=$h}; " +
+    'exit $r.ReturnValue'
   try {
-    const r = await $.process.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', ps], { timeoutMs: 20000 })
+    const r = await $.process.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', ps], {
+      timeoutMs: 20000,
+      env: { VK_HUB_HOME: home.replace(/\//g, '\\') },
+    })
     if (r.exitCode !== 0) $.ui.log(`хаб не запустился, код ${r.exitCode} ${r.stderr.slice(0, 200)}`)
   } catch (err) {
     $.ui.log('не удалось запустить хаб: ' + String(err))
@@ -99,6 +157,7 @@ async function spawnHub($: EngineInterface): Promise<void> {
 
 async function ensureHub($: EngineInterface): Promise<boolean> {
   if (await hubAlive($)) return true
+  lastSpawn = 0
   await spawnHub($)
   for (let i = 0; i < 12; i++) {
     await $.clock.sleep(400)
@@ -109,7 +168,7 @@ async function ensureHub($: EngineInterface): Promise<boolean> {
 
 async function registerBridge($: EngineInterface, quiet: boolean): Promise<boolean> {
   try {
-    const r = await hubPost($, '/bridge/on', { sid, label, cwd, rules, quiet })
+    const r = await hubFetch($, '/bridge/on', { sid, label, cwd, rules, quiet })
     if (r.ok) {
       label = r.label
       registered = true
@@ -122,19 +181,10 @@ async function registerBridge($: EngineInterface, quiet: boolean): Promise<boole
   return false
 }
 
-async function save($: EngineInterface): Promise<void> {
-  const value: Saved = { enabled, label, rules, mode }
-  await $.store.set('bridge:' + sid, value)
-}
-
-function showStatus($: EngineInterface): void {
-  $.ui.status(enabled ? `ВК ● ${label}` : undefined)
-}
-
-async function send($: EngineInterface, text: string): Promise<boolean> {
+async function send($: EngineInterface, text: string, kind: Kind = 'reply'): Promise<boolean> {
   if (!enabled || !text.trim()) return false
   try {
-    const r = await hubPost($, '/send', { sid, text })
+    const r = await hubFetch($, '/send', { sid, text, kind })
     if (r.known === false) registered = false
     return !!r.ok
   } catch {
@@ -142,8 +192,68 @@ async function send($: EngineInterface, text: string): Promise<boolean> {
   }
 }
 
+// ---------------------------------------------------------------- state
+
+async function save($: EngineInterface): Promise<void> {
+  const value: Saved = { enabled, label, rules, mode, at: Date.now() }
+  try {
+    await $.store.set('bridge:' + sid, value)
+  } catch (err) {
+    $.ui.log('состояние моста не сохранено: ' + String(err))
+  }
+}
+
+function showStatus($: EngineInterface): void {
+  $.ui.status(enabled ? `ВК ● ${label}` : undefined)
+}
+
+// После /clear и /resume процесс продолжается под другим id сессии: подхватываем её состояние.
+async function rebind($: EngineInterface): Promise<void> {
+  const cur = await $.session.id()
+  if (cur === sid) return
+  if (enabled && sid) {
+    try {
+      await hubFetch($, '/bridge/off', { sid })
+    } catch {
+      // хаба нет
+    }
+  }
+  sid = cur
+  registered = false
+  vkTurns.clear()
+  pending = []
+  noteSent = ''
+  lastHuman = undefined
+  const saved = (await $.store.get('bridge:' + sid)) as Saved | undefined
+  acked = ((await $.store.get('ack:' + sid)) as number | undefined) ?? 0
+  label = saved?.label || shortLabel(baseName(cwd))
+  rules = saved?.rules || ''
+  mode = saved?.mode ?? 'answers'
+  enabled = !!saved?.enabled
+  showStatus($)
+}
+
+// Убирает записи давно выключенных мостов, чтобы общий $.store не рос бесконечно.
+async function cleanStore($: EngineInterface): Promise<void> {
+  try {
+    const month = Date.now() - 30 * 86400_000
+    for (const key of await $.store.keys()) {
+      if (!key.startsWith('bridge:') || key === 'bridge:' + sid) continue
+      const v = (await $.store.get(key)) as Saved | undefined
+      if (v && !v.enabled && (v.at ?? 0) < month) {
+        await $.store.delete(key)
+        await $.store.delete('ack:' + key.slice(7))
+      }
+    }
+  } catch {
+    // не критично
+  }
+}
+
+// ---------------------------------------------------------------- actions
+
 async function enable($: EngineInterface, newLabel: string | undefined, newRules: string | undefined): Promise<string> {
-  if (newLabel) label = newLabel
+  if (newLabel) label = shortLabel(newLabel)
   if (newRules !== undefined) rules = newRules
   const wasOn = enabled
   enabled = true
@@ -152,27 +262,28 @@ async function enable($: EngineInterface, newLabel: string | undefined, newRules
     return 'Хаб не запустился. Проверь .env в папке vk-alert (VK_TOKEN, VK_GROUP_ID, VK_OWNER_ID) и data/hub.log.'
   }
   const ok = await registerBridge($, wasOn && registered)
+  noteSent = ''
   await save($)
   showStatus($)
-  return ok ? `ВК-мост включён, метка «${label}».` : 'Мост включён, но хаб не принял регистрацию, попробую снова в фоне.'
+  return ok ? `ВК-мост включён, метка «${label}», режим «${mode}».` : 'Мост включён, но хаб не принял регистрацию, попробую снова в фоне.'
 }
 
 async function disable($: EngineInterface, note: string, forget: boolean): Promise<string> {
   if (!enabled) return 'ВК-мост и так выключен.'
   enabled = false
   registered = false
+  if (forget) await save($)
+  showStatus($)
   try {
-    await hubPost($, '/bridge/off', { sid, note })
+    await hubFetch($, '/bridge/off', { sid, note })
   } catch {
     // хаб уже не работает
   }
-  if (forget) await save($)
-  showStatus($)
   return 'ВК-мост выключен.'
 }
 
-async function update($: EngineInterface, newLabel: string | undefined, newRules: string | undefined, newMode?: Mode): Promise<string> {
-  if (newLabel) label = newLabel
+async function update($: EngineInterface, newLabel?: string, newRules?: string, newMode?: Mode): Promise<string> {
+  if (newLabel) label = shortLabel(newLabel)
   if (newRules !== undefined) rules = newRules
   if (newMode) mode = newMode
   if (enabled) await registerBridge($, true)
@@ -187,62 +298,87 @@ function statusText(): string {
     : 'ВК-мост выключен.'
 }
 
+// Сообщение из ВК не проходит через собственный хук prompt.submit мода,
+// поэтому пояснение моста приклеиваем прямо к тексту, когда оно изменилось.
 function submit($: EngineInterface, text: string): void {
-  $.prompt.submit({ text, asUser: true }).then(
+  const note = contextNote()
+  const full = note !== noteSent ? `${text}\n\n<vk-bridge>\n${note}\n</vk-bridge>` : text
+  $.prompt.submit({ text: full, asUser: true }).then(
     res => {
       const drop = (res as { drop?: string }).drop
       if (drop) pending.push(text)
+      else noteSent = note
     },
     () => pending.push(text),
   )
 }
 
-async function handle($: EngineInterface, item: { kind: string; text: string }): Promise<void> {
+async function handle($: EngineInterface, item: Item, batchStart: boolean): Promise<void> {
   if (item.kind === 'off') {
-    await disable($, '⏹ мост выключен с телефона', true)
+    await disable($, 'мост выключен с телефона', true)
     $.ui.toast('ВК-мост выключен с телефона')
     return
   }
   if (item.kind === 'stop') {
     if (busy && currentTurn) {
+      stoppedByVk = currentTurn
+      lastHuman = undefined // итоги фоновых команд этого хода в ВК не пойдут
       try {
         await $.turn.abort({ turnId: currentTurn })
-        await send($, '⏹ остановил текущую работу')
-      } catch (err) {
-        await send($, 'не получилось остановить: ' + String(err))
+        await send($, 'остановил. Команды, ушедшие в фон, могут ещё работать', 'service')
+      } catch {
+        stoppedByVk = undefined
+        await send($, 'ход уже закончился', 'service')
       }
     } else {
-      await send($, 'сейчас ничего не выполняется')
+      await send($, 'сейчас ничего не выполняется', 'service')
     }
     return
   }
-  if (busy && !busyNoted) {
+  // «занят» только если идёт уже начатый ход, а не тот, что запустило соседнее сообщение из этой же пачки
+  if (busy && batchStart && !busyNoted && Date.now() - turnStartedAt > 5000) {
     busyNoted = true
-    await send($, '⏳ занят, сообщение получил, возьму после текущего шага')
+    await send($, 'занят, возьму после текущего шага', 'service')
   }
   submit($, MARK + item.text)
 }
 
 async function tick($: EngineInterface): Promise<void> {
-  if (!enabled || inflight || !sid) return
+  if (inflight) return
   inflight = true
   try {
+    await rebind($)
+    if (!enabled || !sid) return
     if (!registered && !(await registerBridge($, true))) {
-      if (Date.now() - lastSpawn > 20000) await spawnHub($)
+      if (!(await hubAlive($))) await spawnHub($)
       return
     }
-    const r = await $.http.fetch(`${HUB}/inbox?sid=${encodeURIComponent(sid)}&wait=20&busy=${busy ? 1 : 0}&ack=${acked}`, { headers: HEADERS })
-    if (!r.ok) return
-    const data = JSON.parse(r.text) as { known: boolean; messages: { id: number; kind: string; text: string }[] }
+    if (!busy && pending.length && Date.now() - lastRetry > 10000) {
+      lastRetry = Date.now()
+      const retry = pending
+      pending = []
+      for (const t of retry) submit($, t)
+    }
+    const data = await hubFetch($, `/inbox?sid=${encodeURIComponent(sid)}&wait=20&busy=${busy ? 1 : 0}&ack=${acked}`)
+    if (data.status !== 200) return
     if (!data.known) {
       registered = false
       return
     }
-    for (const item of data.messages) {
+    const stored = ((await $.store.get('ack:' + sid)) as number | undefined) ?? 0
+    acked = Math.max(acked, stored)
+    let first = true
+    for (const item of data.messages as Item[]) {
+      if (!enabled) break
       if (item.id <= acked) continue
       acked = item.id
-      await $.store.set('ack:' + sid, acked)
-      await handle($, item)
+      try {
+        await $.store.set('ack:' + sid, acked)
+      } catch (err) {
+        $.ui.log('подтверждение не сохранено: ' + String(err))
+      }
+      await handle($, item, first)
+      first = false
     }
   } catch {
     registered = false
@@ -251,36 +387,31 @@ async function tick($: EngineInterface): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------- hooks
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    sid = await $.session.id()
     cwd = e.cwd
-    label = baseName(cwd) + ' · ' + sid.slice(0, 4)
-    const saved = (await $.store.get('bridge:' + sid)) as Saved | undefined
-    acked = ((await $.store.get('ack:' + sid)) as number | undefined) ?? 0
-    if (saved) {
-      label = saved.label || label
-      rules = saved.rules || ''
-      mode = saved.mode ?? 'answers'
-    }
+    sid = ''
+    await rebind($)
 
     await $.tool.register({
       name: 'vk_bridge',
       description:
         'ВК-мост этой сессии: владелец пишет агенту из ВК и получает ответы туда. ' +
-        'Используй, когда пользователь просит включить или выключить ВК-мост (мост, ВК, VK), сменить метку сессии ' +
-        'или задать правила отчёта (например «пиши о статусе после каждого этапа»). ' +
-        'action: on, off, status, set. label задаёт метку, под которой сессия видна в ВК (например «Проект А · Задание 2»). ' +
-        'rules заменяет правила отчёта целиком, пустая строка их стирает. ' +
-        'mode задаёт, что уходит в ВК само: answers (по умолчанию) ответы на сообщения из ВК и итоги работы, запрошенной из ВК; ' +
-        'quiet только ответы на сообщения из ВК, остальное агент шлёт сам через vk_send (режим «только тревоги»); all итог каждого хода, начатого не с клавиатуры. ' +
+        'Используй, когда пользователь просит включить или выключить ВК-мост (мост, ВК, VK), сменить метку сессии, ' +
+        'режим или правила отчёта (например «пиши о статусе после каждого этапа»). action: on, off, status, set. ' +
+        'label это метка, под которой сессия видна в ВК и по которой владелец пишет #метка с телефона: одно короткое слово ' +
+        'до 16 символов, латиница или кириллица, без пробелов, например shopper, ltt-2, аудит. Не описание задачи. ' +
+        'rules заменяет правила отчёта целиком, пустая строка их стирает. mode задаёт, что уходит в ВК само: answers (по умолчанию) ' +
+        'ответы на сообщения из ВК и итоги работы, запрошенной из ВК; quiet только ответы на сообщения из ВК, остальное агент шлёт ' +
+        'сам через vk_send (режим «только тревоги»); all итог каждого хода, начатого не с клавиатуры. ' +
         'Если пользователь просит писать только при проблемах или реже, ставь quiet.',
       inputSchema: {
         type: 'object',
         properties: {
           action: { type: 'string', enum: ['on', 'off', 'status', 'set'] },
-          label: { type: 'string', description: 'Метка сессии в ВК' },
+          label: { type: 'string', description: 'Короткая метка, одно слово до 16 символов' },
           rules: { type: 'string', description: 'Правила отчёта целиком' },
           mode: { type: 'string', enum: ['answers', 'quiet', 'all'], description: 'Что уходит в ВК автоматически' },
         },
@@ -292,10 +423,15 @@ export const register: Register = on => {
       name: 'vk_send',
       description:
         'Отправляет владельцу моста сообщение в ВК от имени этой сессии, когда ВК-мост включён. ' +
-        'Для промежуточного статуса, вопроса или просьбы принять решение. Итоговый ответ хода, начатого из ВК, уходит сам, его дублировать не надо.',
+        'Для промежуточного статуса, вопроса или просьбы принять решение. Итоговый ответ хода, начатого из ВК, уходит сам, его дублировать не надо. ' +
+        'Пиши коротко, обычным текстом. level alert делает сообщение заметным (‼️ ПРОБЛЕМА): только когда без владельца нельзя продолжать ' +
+        'или есть риск потерять данные, деньги или доступ. Обычные отчёты, вопросы по ходу работы и «готово» отправляй с level info.',
       inputSchema: {
         type: 'object',
-        properties: { text: { type: 'string', description: 'Текст сообщения' } },
+        properties: {
+          text: { type: 'string', description: 'Текст сообщения' },
+          level: { type: 'string', enum: ['info', 'alert'], description: 'info обычное, alert реальная проблема' },
+        },
         required: ['text'],
       },
       isDeferred: false,
@@ -303,7 +439,7 @@ export const register: Register = on => {
     try {
       await $.command.register({
         name: 'vk',
-        description: 'ВК-мост этой сессии: on, off, status, label <метка>, rules <правила>, mode answers|quiet|all',
+        description: 'ВК-мост этой сессии: on [метка], off, status, label <метка>, rules <правила>, mode answers|quiet|all',
         argumentHint: 'on|off|status|label|rules|mode',
         immediate: true,
       })
@@ -314,21 +450,20 @@ export const register: Register = on => {
     $.clock.every(1000, () => {
       void tick($)
     })
-
-    if (saved?.enabled) {
-      enabled = true
-      showStatus($)
-    }
+    void cleanStore($)
     return next(e)
   })
 
   on('session.end', async ($, e, next) => {
     if (enabled) {
       if (e.reason === 'clear') {
-        await disable($, '⏹ мост выключен (/clear)', true)
+        await disable($, 'мост выключен (/clear)', true)
       } else {
+        // store не трогаем: при возврате в эту сессию мост включится сам
+        enabled = false
+        registered = false
         try {
-          await hubPost($, '/bridge/off', { sid, note: '💤 сессия закрыта' })
+          await hubFetch($, '/bridge/off', { sid, note: 'сессия закрыта' })
         } catch {
           // хаба нет
         }
@@ -337,7 +472,13 @@ export const register: Register = on => {
     return next(e)
   })
 
+  on('session.compact', async ($, e, next) => {
+    noteSent = '' // после сжатия пояснение моста нужно дать заново
+    return next(e)
+  })
+
   on('command.run', { command: 'vk' }, async ($, e) => {
+    await rebind($)
     const args = (e.args ?? '').trim()
     const [verb, ...rest] = args.split(/\s+/)
     const tail = rest.join(' ')
@@ -345,14 +486,14 @@ export const register: Register = on => {
       case 'on':
         return { text: await enable($, tail || undefined, undefined) }
       case 'off':
-        return { text: await disable($, '⏹ мост выключен', true) }
+        return { text: await disable($, 'мост выключен', true) }
       case 'label':
-        return { text: await update($, tail || undefined, undefined) }
+        return { text: tail ? await update($, tail) : 'Укажи метку: /vk label shopper' }
       case 'rules':
         return { text: await update($, undefined, tail === 'clear' ? '' : tail) }
       case 'mode': {
         const m = parseMode(tail.toLowerCase())
-        return { text: m ? await update($, undefined, undefined, m) : 'Режимы: answers, quiet, all. Сейчас «' + mode + '».' }
+        return { text: m ? await update($, undefined, undefined, m) : `Режимы: answers, quiet, all. Сейчас «${mode}».` }
       }
       default:
         return { text: statusText() }
@@ -360,23 +501,29 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: TOOL_BRIDGE }, async ($, e) => {
-    const input = e as unknown as { action: string; label?: string; rules?: string; mode?: string }
+    await rebind($)
+    const input = e as unknown as { action?: unknown; label?: unknown; rules?: unknown; mode?: unknown }
+    const str = (v: unknown) => (typeof v === 'string' ? v : undefined)
+    const newMode = parseMode(str(input.mode))
     let text: string
-    const newMode = parseMode(input.mode)
-    if (newMode) mode = newMode
-    if (input.action === 'on') text = await enable($, input.label, input.rules)
-    else if (input.action === 'off') text = await disable($, '⏹ мост выключен', true)
-    else if (input.action === 'set') text = await update($, input.label, input.rules, newMode)
-    else text = statusText()
+    if (input.action === 'on') {
+      if (newMode) mode = newMode
+      text = await enable($, str(input.label), str(input.rules))
+    } else if (input.action === 'off') text = await disable($, 'мост выключен', true)
+    else if (input.action === 'set') text = await update($, str(input.label), str(input.rules), newMode)
+    else if (input.action === 'status') text = statusText()
+    else text = 'Неизвестный action, допустимы on, off, status, set.'
     return { result: text }
-  })
+  }).catch(() => ({ result: 'Ошибка ВК-моста, попробуй ещё раз или /vk status.' }))
 
   on('tool.call', { tool: TOOL_SEND }, async ($, e) => {
-    const input = e as unknown as { text: string }
+    const input = e as unknown as { text?: unknown; level?: unknown }
+    const text = typeof input.text === 'string' ? input.text : ''
     if (!enabled) return { result: 'ВК-мост выключен, сообщение не отправлено.' }
-    const ok = await send($, input.text)
-    return { result: ok ? 'Отправлено в ВК.' : 'Не отправлено: хаб недоступен.' }
-  })
+    if (!text.trim()) return { result: 'Пустой текст, ничего не отправлено.' }
+    const ok = await send($, text, input.level === 'alert' ? 'alert' : 'reply')
+    return { result: ok ? 'Отправлено в ВК.' : 'Не отправлено: хаб или ВК недоступны.' }
+  }).catch(() => ({ result: 'Ошибка ВК-моста, сообщение не отправлено.' }))
 
   on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
     if (!enabled) return next(e)
@@ -387,9 +534,15 @@ export const register: Register = on => {
   })
 
   on('prompt.submit', async ($, e, next) => {
+    if (e.command) return next(e)
+    if (e.origin.kind === 'composer') lastHuman = 'local'
     if (e.turnId === undefined) lastOrigin = e.origin.kind
     if (!enabled) return next(e)
-    return next({ ...e, context: [...(e.context ?? []), contextNote()] })
+    const note = contextNote()
+    if (note === noteSent) return next(e)
+    const r = await next({ ...e, context: [...(e.context ?? []), note] })
+    if (!('drop' in r)) noteSent = note
+    return r
   })
 
   on('turn.start', async ($, e, next) => {
@@ -397,6 +550,7 @@ export const register: Register = on => {
       busy = true
       busyNoted = false
       currentTurn = e.turnId
+      turnStartedAt = Date.now()
       const d = decide(e.text, lastOrigin, mode, lastHuman)
       lastHuman = d.lastHuman
       if (d.forward) vkTurns.add(e.turnId)
@@ -406,21 +560,20 @@ export const register: Register = on => {
   })
 
   on('turn.complete', async ($, e, next) => {
+    const r = await next(e)
     if (e.agentId === undefined) {
       busy = false
       currentTurn = undefined
       if (vkTurns.delete(e.turnId) && enabled) {
-        if (e.isAborted) await send($, '⏹ ход прерван')
-        else if (e.reason === 'error') await send($, '❌ ход оборвался с ошибкой API')
-        else if (e.answer.trim()) await send($, e.answer)
-        else await send($, '✅ готово (без текстового ответа)')
+        if (e.isAborted) {
+          if (stoppedByVk !== e.turnId) void send($, 'ход прерван', 'service')
+        } else if (e.reason === 'error') void send($, 'ход оборвался с ошибкой API', 'alert')
+        else if (e.reason === 'refusal') void send($, 'модель отказалась отвечать', 'service')
+        else if (e.answer.trim()) void send($, e.answer)
+        else void send($, 'готово', 'service')
       }
-      if (pending.length) {
-        const retry = pending
-        pending = []
-        for (const text of retry) submit($, text)
-      }
+      stoppedByVk = undefined
     }
-    return next(e)
+    return r
   })
 }
