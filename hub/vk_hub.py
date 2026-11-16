@@ -59,7 +59,7 @@ def load_env() -> dict:
                 continue
             k, v = line.split("=", 1)
             env[k.strip()] = v.strip().strip('"').strip("'")
-    for k in ("VK_TOKEN", "VK_GROUP_ID", "VK_OWNER_ID", "HUB_PORT", "VK_API"):
+    for k in ("VK_TOKEN", "VK_GROUP_ID", "VK_OWNER_ID", "HUB_PORT", "VK_API", "VK_SHELL"):
         if k in os.environ:
             env[k] = os.environ[k]
     return env
@@ -79,6 +79,7 @@ TOKEN = CFG.get("VK_TOKEN", "")
 GROUP_ID = to_int(CFG.get("VK_GROUP_ID"))
 OWNER_ID = to_int(CFG.get("VK_OWNER_ID"))
 API_BASE = CFG.get("VK_API", "https://api.vk.ru/method/")
+SHELL = CFG.get("VK_SHELL", "") == "1"   # "! команда" из ВК выполняется на компьютере
 
 
 def private_dir(path: Path):
@@ -236,6 +237,22 @@ def is_stop(text: str) -> bool:
     return norm_cmd(text) in ("стоп", "stop", "/stop", "/стоп")
 
 
+YES = {"да", "yes", "ок", "ok", "разрешаю", "можно", "давай", "+"}
+NO = {"нет", "no", "не надо", "нельзя", "отказ", "-"}
+
+
+def shell_command(text: str) -> str:
+    """"! команда" -> команда. "!!", "!!! срочно" и "!" без текста не команды."""
+    m = re.match(r"^!(?!!)\s*(\S[\s\S]*)$", text.strip())
+    return m.group(1).strip() if m else ""
+
+
+def https_url(url: str) -> str:
+    """События Long Poll запускают работу на компьютере, поэтому берём их только по TLS."""
+    url = str(url)
+    return "https://" + (url.split("://", 1)[1] if "://" in url else url)
+
+
 # ---------------------------------------------------------------- state
 
 _seq_lock = threading.Lock()
@@ -287,6 +304,8 @@ class Hub:
         self.ghosts: dict[str, Bridge] = {}        # reaped bridges, kept to restore their queue
         self.cmid_to_sid: dict[int, str] = {}      # conversation_message_id of our message -> sid
         self.pending: dict[str, str] = {}          # route key -> text awaiting "кому?"
+        self.asks: dict[str, dict] = {}            # ask id -> {"sid", "answer"}: агент ждёт «да» или «нет»
+        self.ask_cond = threading.Condition(self.lock)
         self.stub_out: list[dict] = []
         self.no_bridges_since = time.time()
         self.started = time.time()
@@ -322,7 +341,63 @@ class Hub:
         log.info("bridge on %s %s", sid, label)
         return b
 
+    # ---- questions with a yes/no answer (permission requests)
+    def ask_open(self, sid: str, text: str) -> str | None:
+        key = secrets.token_hex(4)
+        with self.lock:
+            self.asks[key] = {"sid": sid, "answer": None}
+        buttons = [[{"action": {"type": "text", "label": label, "payload": json.dumps({"ask": key, "v": v})},
+                     "color": color} for label, v, color in (("Да", "yes", "positive"), ("Нет", "no", "negative"))]]
+        if not self.send(sid, text, keyboard={"inline": True, "buttons": buttons}):
+            with self.lock:
+                self.asks.pop(key, None)
+            return None
+        return key
+
+    def ask_wait(self, key: str, wait: float) -> str:
+        """"yes", "no", "gone" (вопроса нет) или "" (ответа пока нет)."""
+        deadline = time.time() + wait
+        with self.ask_cond:
+            while True:
+                a = self.asks.get(key)
+                if a is None:
+                    return "gone"
+                if a["answer"]:
+                    del self.asks[key]
+                    return a["answer"]
+                left = deadline - time.time()
+                if left <= 0:
+                    return ""
+                self.ask_cond.wait(left)
+
+    def ask_close(self, key: str, note: str | None):
+        with self.ask_cond:
+            a = self.asks.pop(key, None)
+            self.ask_cond.notify_all()
+        if a and note:
+            self.send(a["sid"], note, kind="service")
+
+    def ask_answer(self, key: str, answer: str) -> bool:
+        with self.ask_cond:
+            a = self.asks.get(key)
+            if not a or a["answer"]:
+                return False
+            a["answer"] = answer
+            self.ask_cond.notify_all()
+            sid = a["sid"]
+        self.send(sid, "разрешил" if answer == "yes" else "отказал", kind="service")
+        return True
+
+    def open_ask(self, sid: str) -> str | None:
+        with self.lock:
+            keys = [k for k, a in self.asks.items() if a["sid"] == sid and not a["answer"]]
+        return keys[-1] if keys else None
+
     def bridge_off(self, sid: str, note: str | None):
+        with self.ask_cond:
+            for k in [k for k, a in self.asks.items() if a["sid"] == sid]:
+                del self.asks[k]
+            self.ask_cond.notify_all()
         with self.lock:
             b = self.bridges.pop(sid, None)
             if not self.bridges:
@@ -364,7 +439,7 @@ class Hub:
         if kind == "service":
             body, head = (f"{label} · {text}" if label else text), None
         else:
-            body = plain(text)
+            body = text if kind == "output" else plain(text)   # вывод команды не переделываем
             head = (f"‼️ ПРОБЛЕМА · {label}" if kind == "alert" else label) if label else \
                    ("‼️ ПРОБЛЕМА" if kind == "alert" else None)
         body = redact(body)
@@ -398,6 +473,10 @@ class Hub:
 
         if payload.get("route"):                    # a "кому?" button press
             return self.on_route_button(payload)
+        if payload.get("ask"):                      # «Да» / «Нет» под вопросом агента
+            if not self.ask_answer(str(payload["ask"]), "yes" if payload.get("v") == "yes" else "no"):
+                self.say("Этот вопрос уже закрыт.")
+            return
 
         extras = [a.get("type", "?") for a in msg.get("attachments") or []]
         if msg.get("fwd_messages"):
@@ -420,7 +499,7 @@ class Hub:
 
         target = self.route(msg, text)
         if isinstance(target, tuple) and isinstance(target[0], Bridge):
-            self.deliver(*target)
+            self.deliver(*target, at=to_int(msg.get("date")) or None)
             if extras:
                 self.say("Текст передан, вложения и пересланные сообщения агенту не уходят.")
             return
@@ -496,11 +575,24 @@ class Hub:
             return (bs[0], text)
         return "none" if not bs else "ask"
 
-    def deliver(self, b: Bridge, text: str):
+    def deliver(self, b: Bridge, text: str, at: float | None = None):
         if not text:
             return
-        kind = "stop" if is_stop(text) else "msg"
-        b.push({"kind": kind, "text": text, "at": time.time()})
+        key = self.open_ask(b.sid)
+        word = norm_cmd(text)
+        if key and word in YES | NO:               # ответ словом на открытый вопрос этой сессии
+            self.ask_answer(key, "yes" if word in YES else "no")
+            return
+        if is_stop(text):
+            kind = "stop"
+        elif shell_command(text):
+            if not SHELL:
+                return self.say("Команды с телефона выключены. Включаются строкой VK_SHELL=1 в .env хаба.")
+            kind = "shell"
+        else:
+            kind = "msg"
+        # at это время отправки из ВК: мод не выполнит команду, пролежавшую слишком долго
+        b.push({"kind": kind, "text": text, "at": at or time.time()})
         log.info("deliver %s -> %s (%d симв.)", kind, b.label, len(text))
 
     def cmd_list(self):
@@ -533,6 +625,8 @@ class Hub:
             "• включён один мост, просто пиши\n"
             "• несколько, отвечай на сообщение агента или начни с #метка\n"
             "• стоп, прервать работу агента\n"
+            "• сразу ..., передать агенту посреди работы, не дожидаясь конца хода\n"
+            "• ! команда, выполнить команду в папке сессии (если включено VK_SHELL=1)\n"
             "• /list, какие мосты включены\n"
             "• /off метка или /off all, выключить мост")
 
@@ -637,7 +731,7 @@ def longpoll_loop():
         try:
             if not server:
                 lp = vk_call("groups.getLongPollServer", {"group_id": GROUP_ID})
-                server, key = lp["server"], lp["key"]
+                server, key = https_url(lp["server"]), lp["key"]
                 if ts is None:
                     ts = lp["ts"]
                     save_ts(ts)
@@ -747,6 +841,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"known": False, "messages": []})
             b.busy = q.get("busy") == "1"
             return self._json(200, {"known": True, "messages": b.take(wait, ack)})
+        if u.path == "/ask":
+            try:
+                wait = max(0.0, min(float(q.get("wait", "20")), 25.0))
+            except ValueError:
+                return self._json(400, {"error": "bad wait"})
+            return self._json(200, {"answer": HUB.ask_wait(q.get("id", ""), wait)})
         if u.path == "/stub/out" and STUB:
             since = int(q.get("since", "0") or 0)
             return self._json(200, {"messages": [m for m in HUB.stub_out if m["id"] >= since]})
@@ -769,15 +869,26 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": "sid required"})
             b = HUB.bridge_on(sid, str(d.get("label") or ""), str(d.get("cwd") or ""),
                               str(d.get("rules") or ""), bool(d.get("quiet")))
-            return self._json(200, {"ok": True, "label": b.label})
+            return self._json(200, {"ok": True, "label": b.label, "shell": SHELL})
+        if p == "/ask":
+            text = str(d.get("text") or "").strip()
+            with HUB.lock:
+                known = sid in HUB.bridges
+            if not text or not known:
+                return self._json(400, {"error": "known sid and text required"})
+            key = HUB.ask_open(sid, text)
+            return self._json(200 if key else 502, {"ok": bool(key), "id": key})
+        if p == "/ask/close":
+            HUB.ask_close(str(d.get("id") or ""), d.get("note") and str(d["note"]))
+            return self._json(200, {"ok": True})
         if p == "/bridge/off":
             HUB.bridge_off(sid, d.get("note") and str(d["note"]))
             return self._json(200, {"ok": True})
         if p == "/send":
             text = str(d.get("text") or "").strip()
             kind = str(d.get("kind") or "reply")
-            if not text or kind not in ("reply", "service", "alert"):
-                return self._json(400, {"error": "text and kind reply|service|alert required"})
+            if not text or kind not in ("reply", "service", "alert", "output"):
+                return self._json(400, {"error": "text and kind reply|service|alert|output required"})
             with HUB.lock:
                 known = sid in HUB.bridges
             if sid and not known:
@@ -787,7 +898,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200 if ok else 502, {"ok": ok})
         if p == "/stub/in" and STUB:
             msg = {"from_id": OWNER_ID, "peer_id": OWNER_ID, "text": str(d.get("text") or ""),
-                   "payload": d.get("payload"), "attachments": d.get("attachments") or []}
+                   "payload": d.get("payload"), "attachments": d.get("attachments") or [],
+                   "date": to_int(d.get("date")) or int(time.time())}
             if d.get("reply_to"):
                 msg["reply_message"] = {"conversation_message_id": int(d["reply_to"]), "from_id": -GROUP_ID}
             HUB.on_owner_message(msg)

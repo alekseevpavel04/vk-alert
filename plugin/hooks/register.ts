@@ -1,5 +1,19 @@
 import type { Register, EngineInterface } from 'claude-code'
-import { decide, MARK, MODES, parseMode, type Human, type Mode } from './forward.js'
+import {
+  decide,
+  finalAnswer,
+  isNow,
+  MARK,
+  MODES,
+  oneLine,
+  parseMode,
+  shellCommand,
+  shellReport,
+  shellRow,
+  type Human,
+  type Mode,
+  type ShellRun,
+} from './forward.js'
 import { enc, hex, hmacHex, sha256 } from './crypto.js'
 
 // ВК-мост для одной сессии Claude Code.
@@ -11,10 +25,15 @@ import { enc, hex, hmacHex, sha256 } from './crypto.js'
 const TOOL_BRIDGE = 'mcp__vk-bridge__vk_bridge'
 const TOOL_SEND = 'mcp__vk-bridge__vk_send'
 const LABEL_MAX = 16
+const ACK_AFTER_MS = 90_000 // молчит дольше, значит владельцу пора узнать, что сообщение взято
+const SHELL_TIMEOUT_MS = 600_000 // больше не даёт $.process.run
+const SHELL_NOTE_MS = 15_000
+const SHELL_FRESH_S = 600 // команду, пролежавшую дольше (компьютер спал, сессия была закрыта), не выполняем
 
 type Saved = { enabled: boolean; label: string; rules: string; mode?: Mode; at?: number }
-type Kind = 'reply' | 'service' | 'alert'
-type Item = { id: number; kind: string; text: string }
+type Kind = 'reply' | 'service' | 'alert' | 'output'
+type Item = { id: number; kind: string; text: string; at?: number }
+type Injected = { turn: string; step: number; text: string; wasVk: boolean }
 
 let sid = ''
 let cwd = ''
@@ -39,6 +58,14 @@ let acked = 0
 let noteSent = ''
 let hubKey: Uint8Array | undefined
 let hubUrl = ''
+let shellOn = false // хаб разрешил «! команда» (VK_SHELL=1 в .env)
+let bashPath: string | undefined
+let stepSeq = 0 // шаги главного цикла: шаг после вставки значит, что модель её прочла
+let injected: Injected[] = []
+const beforeHook = new Map<string, string>() // ответ хода до обратной связи Stop-хука
+let askReason = '' // почему движок спрашивает разрешение (текст guard-хука), для вопроса в ВК
+let ackDue = 0 // когда сказать «взял в работу», если агент молчит
+let toldTurn: string | undefined // ход, в котором владелец уже что-то получил
 
 // ---------------------------------------------------------------- helpers
 
@@ -56,8 +83,13 @@ function contextNote(): string {
   return [
     `ВК-мост включён для этой сессии, метка «${label}». Владелец моста может быть не у компьютера и читает ответы в ВК.`,
     `Сообщения, которые начинаются с «${MARK.trim()}», владелец прислал из ВК. Итоговый ответ хода, начатого таким сообщением, уйдёт ему в ВК автоматически, пиши его коротко и по делу, без таблиц.`,
-    `Режим автоотправки «${mode}»: ${MODES[mode]}. Ходы, начатые с клавиатуры, и ответы на обратную связь хуков в ВК не уходят.`,
+    'Владелец ждёт ответа на каждое своё сообщение, иначе не знает, дошло ли оно. Если работа по сообщению займёт больше пары минут, сначала коротко ответь через vk_send (что понял, что делаешь, когда ждать итог), потом работай.',
+    'Сообщение из ВК может прийти посреди хода, если владелец начал его словом «сразу». Ответь на него через vk_send, не дожидаясь конца работы.',
+    `Режим автоотправки «${mode}»: ${MODES[mode]}. Ходы, начатые с клавиатуры, в ВК не уходят. Если Stop-хук вернул тебя к работе, в ВК уйдёт ответ до его обратной связи. Ответ самому хуку владельцу не пересылай, через vk_send отправляй только то, что меняет для него картину.`,
     'Промежуточные сообщения (статус, вопрос, просьба принять решение) отправляй инструментом vk_send. level alert ставь только при реальной проблеме, когда без владельца нельзя продолжать или есть риск потерять данные, деньги или доступ. Всё остальное обычным уровнем.',
+    ...(shellOn
+      ? ['Владелец может выполнить команду с телефона, написав «! команда». Она идёт в bash в папке сессии, вывод появится в разговоре, как после ! в терминале. Если просишь владельца что-то запустить, пиши команду одной строкой, начиная с «! », чтобы её можно было скопировать.']
+      : []),
     'AskUserQuestion при включённом мосте не работает. Вопрос задавай через vk_send с пронумерованными вариантами и заканчивай ход, ответ придёт сообщением из ВК.',
     'Сменить метку, правила отчёта, режим или выключить мост можно инструментом vk_bridge. Если правила ограничивают сообщения (например «только при проблемах»), поставь режим quiet.',
     rules ? `Правила отчёта от владельца: ${rules}` : 'Особых правил отчёта не задано.',
@@ -171,6 +203,7 @@ async function registerBridge($: EngineInterface, quiet: boolean): Promise<boole
     const r = await hubFetch($, '/bridge/on', { sid, label, cwd, rules, quiet })
     if (r.ok) {
       label = r.label
+      shellOn = r.shell === true
       registered = true
       return true
     }
@@ -221,6 +254,8 @@ async function rebind($: EngineInterface): Promise<void> {
   sid = cur
   registered = false
   vkTurns.clear()
+  beforeHook.clear()
+  injected = []
   pending = []
   noteSent = ''
   lastHuman = undefined
@@ -335,12 +370,133 @@ async function handle($: EngineInterface, item: Item, batchStart: boolean): Prom
     }
     return
   }
+  if (item.kind === 'shell') {
+    void runShell($, item) // не ждём: опрос хаба и «стоп» не должны стоять, пока идёт команда
+    return
+  }
+  if (busy && isNow(item.text) && (await inject($, item.text))) return
   // «занят» только если идёт уже начатый ход, а не тот, что запустило соседнее сообщение из этой же пачки
   if (busy && batchStart && !busyNoted && Date.now() - turnStartedAt > 5000) {
     busyNoted = true
-    await send($, 'занят, возьму после текущего шага', 'service')
+    await send($, 'занят, прочитаю после текущего хода. Срочное начни словом «сразу»', 'service')
   }
   submit($, MARK + item.text)
+}
+
+function permissionText(tool: string, input: unknown, reason: string): string {
+  const args = input as { command?: unknown; file_path?: unknown; url?: unknown } | undefined
+  const what = typeof args?.command === 'string' ? args.command : typeof args?.file_path === 'string' ? args.file_path : typeof args?.url === 'string' ? args.url : JSON.stringify(input ?? {})
+  return [
+    'Нужно твоё разрешение, работа стоит.',
+    reason ? oneLine(reason, 300) : '',
+    `${tool}: ${oneLine(what, 700)}`,
+    'Нажми «Да» или «Нет», или ответь словом.',
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
+
+// Заметка в терминале: человек у компьютера видит, что пришло из ВК мимо обычного промпта.
+async function notice($: EngineInterface, text: string): Promise<void> {
+  try {
+    await $.session.append({ message: { type: 'system', content: [{ type: 'text', text }] } })
+  } catch {
+    // заметка не обязательна
+  }
+}
+
+// «сразу ...»: строка в разговор, которую модель прочтёт на следующем шаге текущего хода.
+async function inject($: EngineInterface, text: string): Promise<boolean> {
+  const turn = currentTurn
+  if (!turn) return false
+  const note = contextNote()
+  const body = MARK + text + (note !== noteSent ? `\n\n<vk-bridge>\n${note}\n</vk-bridge>` : '')
+  try {
+    const r = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: body }] } })
+    if (r.deny) return false
+  } catch {
+    return false
+  }
+  noteSent = note
+  injected.push({ turn, step: stepSeq, text, wasVk: vkTurns.has(turn) })
+  vkTurns.add(turn)
+  lastHuman = 'vk'
+  toldTurn = turn
+  await notice($, `ВК, сразу: ${oneLine(text, 300)}`)
+  await send($, 'передал в текущий ход', 'service')
+  return true
+}
+
+// Тот же bash, что у ! в терминале: на Windows это Git Bash, не bash.exe из WSL.
+async function findBash($: EngineInterface): Promise<string | undefined> {
+  if (bashPath) return bashPath
+  const root = $.plugin.root.replace(/\\/g, '/')
+  if (!/^[A-Za-z]:/.test(root) && !root.startsWith('//')) {
+    bashPath = (await $.fs.exists('/bin/bash')) ? '/bin/bash' : '/bin/sh'
+    return bashPath
+  }
+  const candidates: string[] = []
+  const fromEnv = await $.env.get('CLAUDE_CODE_GIT_BASH_PATH')
+  if (fromEnv) candidates.push(fromEnv)
+  candidates.push('C:/Program Files/Git/bin/bash.exe', 'C:/Program Files (x86)/Git/bin/bash.exe')
+  try {
+    const r = await $.process.run(['where', 'git'], { timeoutMs: 10000 })
+    for (const line of r.stdout.split(/\r?\n/)) {
+      const m = /^(.*)[\\/](?:cmd|bin|mingw64[\\/]bin)[\\/]git\.exe$/i.exec(line.trim())
+      if (m) candidates.push(m[1] + '/bin/bash.exe')
+    }
+  } catch {
+    // git не в PATH
+  }
+  for (const c of candidates) {
+    const path = c.replace(/\\/g, '/')
+    if (await $.fs.exists(path)) {
+      bashPath = path
+      return path
+    }
+  }
+  return undefined
+}
+
+// «! команда» из ВК: выполняем в папке сессии, вывод владельцу в ВК и агенту в разговор.
+async function runShell($: EngineInterface, item: Item): Promise<void> {
+  const cmd = shellCommand(item.text)
+  if (!cmd) return
+  const age = item.at ? Date.now() / 1000 - item.at : 0
+  if (age > SHELL_FRESH_S) {
+    await send($, `команда пролежала ${Math.round(age / 60)} мин и не выполнена. Если ещё нужна, отправь заново`, 'service')
+    return
+  }
+  const bash = await findBash($)
+  if (!bash) {
+    await send($, 'не нашёл bash (Git for Windows), команда не выполнена', 'service')
+    return
+  }
+  await notice($, `ВК, команда: ${oneLine(cmd, 300)}`)
+  const started = Date.now()
+  let done = false
+  void $.clock.sleep(SHELL_NOTE_MS).then(() => {
+    if (!done) void send($, `выполняю, вывод пришлю, когда закончится (до 10 минут)`, 'service')
+  })
+  const run: ShellRun = { cmd, seconds: 0, stdout: '', stderr: '' }
+  try {
+    const r = await $.process.run([bash, '-c', cmd], { timeoutMs: SHELL_TIMEOUT_MS, env: { PYTHONIOENCODING: 'utf-8' } })
+    run.code = r.exitCode
+    run.stdout = r.stdout
+    run.stderr = r.stderr
+    if (r.isStdoutTruncated || r.isStderrTruncated) run.note = 'вывод обрезан'
+  } catch (err) {
+    run.note = Date.now() - started >= SHELL_TIMEOUT_MS - 1000 ? 'не уложилась в 10 минут и остановлена' : 'не запустилась: ' + oneLine(String(err), 200)
+  }
+  done = true
+  run.seconds = Math.round((Date.now() - started) / 1000)
+  try {
+    await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: shellRow(run) }] } })
+  } catch (err) {
+    $.ui.log('вывод команды не попал в разговор: ' + String(err))
+  }
+  const report = shellReport(run)
+  if (!(await send($, report, 'output'))) await send($, report, 'reply')
 }
 
 async function tick($: EngineInterface): Promise<void> {
@@ -448,6 +604,12 @@ export const register: Register = on => {
     }
 
     $.clock.every(1000, () => {
+      // агент давно молчит над сообщением из ВК: говорим владельцу, что оно взято в работу
+      if (enabled && busy && currentTurn && ackDue && Date.now() > ackDue && toldTurn !== currentTurn) {
+        ackDue = 0
+        toldTurn = currentTurn
+        void send($, 'взял в работу, итог пришлю, когда закончу', 'service')
+      }
       void tick($)
     })
     void cleanStore($)
@@ -522,8 +684,46 @@ export const register: Register = on => {
     if (!enabled) return { result: 'ВК-мост выключен, сообщение не отправлено.' }
     if (!text.trim()) return { result: 'Пустой текст, ничего не отправлено.' }
     const ok = await send($, text, input.level === 'alert' ? 'alert' : 'reply')
+    if (ok && currentTurn) toldTurn = currentTurn
     return { result: ok ? 'Отправлено в ВК.' : 'Не отправлено: хаб или ВК недоступны.' }
   }).catch(() => ({ result: 'Ошибка ВК-моста, сообщение не отправлено.' }))
+
+  // Запоминаем, почему вызов требует разрешения: guard-хук проекта объясняет это в reason.
+  on('tool.check', async ($, e, next) => {
+    const v = await next(e)
+    if (v.decision === 'ask') askReason = v.reason ?? ''
+    return v
+  }).catch(($, e, next) => next(e))
+
+  // Окно Yes/No в терминале: при включённом мосте задаём тот же вопрос в ВК с кнопками.
+  // Кто ответит первым, в ВК или в терминале, тот и решил.
+  on('classic.PermissionRequest', async ($, e, next) => {
+    const r = await next(e)
+    if (r.decision || !enabled || !registered) return r
+    const text = permissionText(e.tool_name, e.tool_input, askReason)
+    askReason = ''
+    let id: string | undefined
+    try {
+      id = (await hubFetch($, '/ask', { sid, text })).id
+    } catch {
+      return r
+    }
+    if (!id) return r
+    if (currentTurn) toldTurn = currentTurn
+    while (!next.signal.aborted) {
+      let answer = ''
+      try {
+        answer = String((await hubFetch($, `/ask?id=${encodeURIComponent(id)}&wait=20`)).answer ?? '')
+      } catch {
+        return r // хаб пропал: остаётся окно в терминале
+      }
+      if (answer === 'yes') return { ...r, decision: { behavior: 'allow' as const } }
+      if (answer === 'no') return { ...r, decision: { behavior: 'deny' as const, message: 'Владелец отказал из ВК.' } }
+      if (answer === 'gone') return r
+    }
+    void hubFetch($, '/ask/close', { id, note: 'вопрос закрыт в терминале' }).catch(() => undefined)
+    return r
+  })
 
   on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
     if (!enabled) return next(e)
@@ -554,9 +754,28 @@ export const register: Register = on => {
       const d = decide(e.text, lastOrigin, mode, lastHuman)
       lastHuman = d.lastHuman
       if (d.forward) vkTurns.add(e.turnId)
+      ackDue = e.text.startsWith(MARK) ? Date.now() + ACK_AFTER_MS : 0
       lastOrigin = undefined
     }
     return next(e)
+  })
+
+  // Считаем шаги главного цикла: шаг, начатый после «сразу», значит, что модель прочла вставку.
+  on('turn.step', async function* ($, e, next) {
+    if (e.agentId === undefined) stepSeq++
+    return yield* next(e)
+  })
+
+  // Stop-хук настроек вернул агента к работе: запоминаем ответ хода до его обратной связи,
+  // в ВК уйдёт он, а не ответ хуку.
+  on('classic.Stop', async ($, e, next) => {
+    const r = await next(e)
+    const turn = currentTurn
+    if (turn && vkTurns.has(turn) && !beforeHook.has(turn) && (r.block || r.additionalContext?.length)) {
+      const text = (e.last_assistant_message ?? '').trim()
+      if (text) beforeHook.set(turn, text)
+    }
+    return r
   })
 
   on('turn.complete', async ($, e, next) => {
@@ -564,15 +783,25 @@ export const register: Register = on => {
     if (e.agentId === undefined) {
       busy = false
       currentTurn = undefined
+      ackDue = 0
+      // «сразу», вставленное, когда модель уже писала последний ответ: она его не прочла
+      const mine = injected.filter(x => x.turn === e.turnId)
+      injected = injected.filter(x => x.turn !== e.turnId)
+      const missed = mine.filter(x => x.step === stepSeq)
+      if (missed.length && missed.length === mine.length && !mine.some(x => x.wasVk)) vkTurns.delete(e.turnId)
+      const before = beforeHook.get(e.turnId)
+      beforeHook.delete(e.turnId)
       if (vkTurns.delete(e.turnId) && enabled) {
+        const answer = finalAnswer(before, e.answer)
         if (e.isAborted) {
           if (stoppedByVk !== e.turnId) void send($, 'ход прерван', 'service')
         } else if (e.reason === 'error') void send($, 'ход оборвался с ошибкой API', 'alert')
         else if (e.reason === 'refusal') void send($, 'модель отказалась отвечать', 'service')
-        else if (e.answer.trim()) void send($, e.answer)
+        else if (answer.trim()) void send($, answer)
         else void send($, 'готово', 'service')
       }
       stoppedByVk = undefined
+      for (const m of missed) submit($, MARK + m.text)
     }
     return r
   })

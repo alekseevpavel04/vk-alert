@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { decide } from '../hooks/forward.js'
+import { decide, finalAnswer, isNow, shellCommand, shellReport, shellRow } from '../hooks/forward.js'
 
 const VK = '[ВК] сделай X'
 
@@ -38,4 +38,48 @@ test('quiet: уходят только ответы на сообщения из
 test('all: любой ход понятного происхождения не с клавиатуры', async () => {
   expect(decide('', 'scheduled-trigger', 'all', 'local').forward).toBe(true)
   expect(decide('', 'peer', 'all', undefined).forward).toBe(true)
+})
+
+test('после Stop-хука в ВК уходит ответ до его обратной связи', async () => {
+  expect(finalAnswer('Все штатно, шаг 316 из 375', 'Записывать нечего')).toBe('Все штатно, шаг 316 из 375')
+  expect(finalAnswer(undefined, 'Готово')).toBe('Готово')
+  expect(finalAnswer('  ', 'Готово')).toBe('Готово')
+})
+
+const NL = String.fromCharCode(10)
+
+test('«сразу» в начале передаёт сообщение в идущий ход', async () => {
+  for (const t of ['сразу как дела', 'Сразу, как дела', 'СРАЗУ: стоп после шага', 'сразу' + NL + 'проверь лог']) {
+    expect(isNow(t)).toBe(true)
+  }
+  for (const t of ['сразу', 'сразу!', 'сразуже', 'как дела сразу', 'не сразу']) expect(isNow(t)).toBe(false)
+})
+
+test('«! команда» распознаётся, «!!» и «!» без текста нет', async () => {
+  expect(shellCommand('! python scripts/r2_job.py get x/')).toBe('python scripts/r2_job.py get x/')
+  expect(shellCommand('!git status')).toBe('git status')
+  expect(shellCommand('  !  ls -la  ')).toBe('ls -la')
+  for (const t of ['!', '!!', '!!! срочно', 'привет ! ls', '']) expect(shellCommand(t)).toBe('')
+})
+
+test('отчёт о команде: код, время, хвост вывода, stderr отдельно', async () => {
+  const r = shellReport({ cmd: 'ls', code: 0, seconds: 2, stdout: ['a', 'b', ''].join(NL), stderr: '' })
+  expect(r).toBe(['! ls', 'код 0, 2 с', 'a', 'b'].join(NL))
+  const long = shellReport({ cmd: 'x', code: 1, seconds: 1, stdout: 'y'.repeat(5000), stderr: 'boom' }, 100)
+  expect(long.endsWith('stderr' + NL + 'boom')).toBe(true)
+  expect(long.length < 200).toBe(true)
+  expect(shellReport({ cmd: 'x', seconds: 600, stdout: '', stderr: '', note: 'не уложилась в 10 минут и остановлена' })).toBe(
+    ['! x', 'не уложилась в 10 минут и остановлена', 'вывода нет'].join(NL),
+  )
+})
+
+test('строка для агента в формате ! из терминала', async () => {
+  const row = shellRow({ cmd: 'git status', code: 0, seconds: 1, stdout: 'clean', stderr: '' })
+  expect(row).toBe(
+    [
+      '[ВК] Владелец выполнил команду с телефона, код 0.',
+      '<bash-input>git status</bash-input>',
+      '<bash-stdout>clean</bash-stdout><bash-stderr></bash-stderr>',
+    ].join(NL),
+  )
 })

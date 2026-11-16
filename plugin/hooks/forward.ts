@@ -1,4 +1,4 @@
-// Решение «уходит ли итог хода в ВК», без побочных эффектов, чтобы его можно было тестировать.
+// Решения и тексты моста без побочных эффектов, чтобы их можно было тестировать.
 
 export type Mode = 'answers' | 'quiet' | 'all'
 export type Human = 'vk' | 'local' | undefined
@@ -38,4 +38,52 @@ export function decide(text: string, origin: string | undefined, mode: Mode, las
   if (mode === 'all') return { forward: true, lastHuman }
   if (mode === 'answers') return { forward: lastHuman === 'vk', lastHuman }
   return { forward: false, lastHuman }
+}
+
+/**
+ * Что уходит в ВК итогом хода. Если Stop-хук вернул агента к работе, итог хода это
+ * ответ на обратную связь хука («записывать нечего»), а владельцу нужен ответ до неё.
+ */
+export function finalAnswer(beforeHook: string | undefined, answer: string): string {
+  return beforeHook?.trim() ? beforeHook : answer
+}
+
+/** «сразу ...» передаёт сообщение в идущий ход, а не после него. */
+export function isNow(text: string): boolean {
+  const t = text.trim()
+  return /^сразу(?=[\s,.:;!?-]|$)/iu.test(t) && t.replace(/^сразу[\s,.:;!?-]*/iu, '') !== ''
+}
+
+/** Команда из «! команда», пустая строка, если это не команда. «!!» и «!» без текста не команды. */
+export function shellCommand(text: string): string {
+  const m = /^!(?!!)\s*(\S[\s\S]*)$/.exec(text.trim())
+  return m ? m[1]!.trim() : ''
+}
+
+export function oneLine(text: string, max: number): string {
+  const s = text.replace(/\s+/g, ' ').trim()
+  return s.length > max ? s.slice(0, max - 1) + '…' : s
+}
+
+export function tail(text: string, max: number): string {
+  return text.length <= max ? text : '…\n' + text.slice(text.length - max)
+}
+
+export type ShellRun = { cmd: string; code?: number; seconds: number; stdout: string; stderr: string; note?: string }
+
+/** Сообщение владельцу в ВК о выполненной команде. */
+export function shellReport(r: ShellRun, max = 3000): string {
+  const status = r.code === undefined ? (r.note ?? 'не выполнена') : `код ${r.code}, ${r.seconds} с` + (r.note ? `, ${r.note}` : '')
+  const out = [r.stdout.trimEnd(), r.stderr.trimEnd() ? 'stderr\n' + r.stderr.trimEnd() : ''].filter(Boolean).join('\n')
+  return [`! ${oneLine(r.cmd, 200)}`, status, out ? tail(out, max) : 'вывода нет'].join('\n')
+}
+
+/** Строка для агента, в том же виде, что оставляет ! в терминале. */
+export function shellRow(r: ShellRun): string {
+  const status = r.code === undefined ? (r.note ?? 'не выполнена') : `код ${r.code}` + (r.note ? `, ${r.note}` : '')
+  return [
+    `${MARK}Владелец выполнил команду с телефона, ${status}.`,
+    `<bash-input>${r.cmd}</bash-input>`,
+    `<bash-stdout>${tail(r.stdout, 30000)}</bash-stdout><bash-stderr>${tail(r.stderr, 10000)}</bash-stderr>`,
+  ].join('\n')
 }

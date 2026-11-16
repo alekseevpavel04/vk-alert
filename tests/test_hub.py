@@ -15,8 +15,8 @@ ROOT = Path(__file__).resolve().parent.parent
 PORT = 8799
 DATA = Path(tempfile.mkdtemp(prefix="vkhub-test-"))
 ENV = dict(os.environ, VK_STUB="1", HUB_PORT=str(PORT), VK_OWNER_ID="1", VK_GROUP_ID="5",
-           VK_TOKEN="", VK_HUB_DATA=str(DATA))
-os.environ.update({k: ENV[k] for k in ("HUB_PORT", "VK_OWNER_ID", "VK_GROUP_ID", "VK_TOKEN", "VK_HUB_DATA")})
+           VK_TOKEN="", VK_HUB_DATA=str(DATA), VK_SHELL="1")
+os.environ.update({k: ENV[k] for k in ("HUB_PORT", "VK_OWNER_ID", "VK_GROUP_ID", "VK_TOKEN", "VK_HUB_DATA", "VK_SHELL")})
 
 spec = importlib.util.spec_from_file_location("vk_hub", ROOT / "hub" / "vk_hub.py")
 hub = importlib.util.module_from_spec(spec)
@@ -83,6 +83,19 @@ def unit_tests():
     changed = [s for s in safe if hub.redact(s) != s]
     check("redact: не трогает обычный текст", not changed, changed)
     check("stop: пунктуация и регистр", all(hub.is_stop(s) for s in ("стоп", "Стоп!", "СТОП.", "stop ", "стоп…")))
+    # shell commands
+    check("! команда", hub.shell_command("! python x.py --a") == "python x.py --a" and hub.shell_command("!ls") == "ls")
+    check("!! и ! без текста не команды", not any(hub.shell_command(s) for s in ("!", "!!", "!!! срочно", "ну ! ls")))
+    # TLS for Long Poll
+    check("long poll только https", hub.https_url("http://lp.vk.com/whp/5") == "https://lp.vk.com/whp/5"
+          and hub.https_url("lp.vk.com/x") == "https://lp.vk.com/x"
+          and hub.https_url("https://lp.vk.com/x") == "https://lp.vk.com/x")
+    # shell switched off: the command is not delivered
+    b = hub.Bridge("u1", "u", "", "")
+    hub.SHELL, hub.STUB = False, True
+    hub.HUB.deliver(b, "! rm -rf build")
+    hub.SHELL, hub.STUB = True, False
+    check("VK_SHELL выключен: команда не доставлена", not b.queue and "выключены" in hub.HUB.stub_out[-1]["text"])
 
 
 def live_tests():
@@ -118,10 +131,50 @@ def live_tests():
         say("привет")
         check("нет мостов", "Нет включённых мостов" in last(), last())
 
-        call("/bridge/on", {"sid": "s1", "label": "shopper", "cwd": "D:/shopper"})
+        status, on = call("/bridge/on", {"sid": "s1", "label": "shopper", "cwd": "D:/shopper"})
         check("включение, служебная строка", last() == "shopper · мост включён", last())
+        check("хаб сообщает моду, что команды разрешены", on.get("shell") is True, on)
         say("сделай X")
         check("один мост, без адреса", inbox("s1")["messages"][0]["text"] == "сделай X")
+
+        # "! команда" goes as shell with the time it was sent
+        say("! git status", date=1700000000)
+        m = inbox("s1")["messages"][0]
+        check("! команда уходит как shell со временем отправки",
+              m["kind"] == "shell" and m["text"] == "! git status" and m["at"] == 1700000000, m)
+        say("!!! срочно глянь")
+        check("!!! это обычное сообщение", inbox("s1")["messages"][0]["kind"] == "msg")
+        say("#shop ! ls")
+        check("#метка и команда", inbox("s1")["messages"][0]["kind"] == "shell")
+
+        # permission question: buttons, a word answer, a closed question
+        status, a = call("/ask", {"sid": "s1", "text": "Нужно твоё разрешение\nBash: modal run x.py"})
+        q = out()[-1]
+        check("вопрос с кнопками Да и Нет", status == 200 and q["keyboard"]["inline"]
+              and [b["action"]["label"] for b in q["keyboard"]["buttons"][0]] == ["Да", "Нет"], q)
+        check("пока ответа нет", call(f"/ask?id={a['id']}&wait=0")[1]["answer"] == "")
+        yes = q["keyboard"]["buttons"][0][0]["action"]["payload"]
+        threading.Timer(0.5, lambda: say("Да", payload=yes)).start()
+        t0 = time.time()
+        check("кнопка «Да» будит ожидание", call(f"/ask?id={a['id']}&wait=5")[1]["answer"] == "yes"
+              and time.time() - t0 < 3 and last() == "shopper · разрешил", last())
+        say("Да", payload=yes)
+        check("повторное нажатие", "уже закрыт" in last(), last())
+        _, a2 = call("/ask", {"sid": "s1", "text": "ещё вопрос"})
+        say("нет!")
+        check("ответ словом и не уходит агенту", call(f"/ask?id={a2['id']}&wait=0")[1]["answer"] == "no"
+              and not inbox("s1")["messages"])
+        _, a3 = call("/ask", {"sid": "s1", "text": "третий"})
+        call("/ask/close", {"id": a3["id"], "note": "вопрос закрыт в терминале"})
+        check("закрыт в терминале", call(f"/ask?id={a3['id']}&wait=0")[1]["answer"] == "gone"
+              and last() == "shopper · вопрос закрыт в терминале", last())
+        say("да")
+        check("«да» без открытого вопроса идёт агенту", inbox("s1")["messages"][0]["text"] == "да")
+
+        # command output is sent as is, without the markdown rewrite
+        call("/send", {"sid": "s1", "text": "| a | b |\n**x** token=abcdef123456", "kind": "output"})
+        check("вывод команды без переделки, секрет скрыт",
+              last() == "shopper\n| a | b |\n**x** token=[REDACTED]", last())
 
         call("/send", {"sid": "s1", "text": "**Готово**, token=abcdef123456"})
         m = out()[-1]
