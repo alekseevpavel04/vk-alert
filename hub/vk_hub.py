@@ -237,6 +237,24 @@ def is_stop(text: str) -> bool:
     return norm_cmd(text) in ("стоп", "stop", "/stop", "/стоп")
 
 
+CIRCLES = ["🔵", "🟢", "🟣", "🟠", "🟡", "🟤", "⚪", "⚫", "🔴"]
+
+
+def load_colors() -> dict:
+    try:
+        v = json.loads((DATA / "colors.json").read_text(encoding="utf-8"))
+        return {str(k): str(c) for k, c in v.items() if c in CIRCLES} if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_colors(colors: dict):
+    try:
+        (DATA / "colors.json").write_text(json.dumps(colors, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
 YES = {"да", "yes", "ок", "ok", "разрешаю", "можно", "давай", "+"}
 NO = {"нет", "no", "не надо", "нельзя", "отказ", "-"}
 
@@ -307,9 +325,26 @@ class Hub:
         self.asks: dict[str, dict] = {}            # ask id -> {"sid", "answer"}: агент ждёт «да» или «нет»
         self.ask_cond = threading.Condition(self.lock)
         self.cmd_buttons: dict[str, dict] = {}     # key -> {"sid", "command"}: кнопка с командой агента
+        self.colors: dict[str, str] = load_colors()  # метка -> кружок, свой цвет у каждого агента
         self.stub_out: list[dict] = []
         self.no_bridges_since = time.time()
         self.started = time.time()
+
+    # ---- colours: a circle per agent, kept for its label across sessions and hub restarts
+    def tag(self, label: str) -> str:
+        c = self.colors.get(label.lower())
+        return f"{c} {label}" if c else label
+
+    def pick_color(self, label: str):
+        key = label.lower()
+        with self.lock:
+            active = {self.colors.get(b.label.lower()) for b in self.bridges.values() if b.label.lower() != key}
+            if key in self.colors and self.colors[key] not in active:
+                return
+            free = [c for c in CIRCLES if c not in active]
+            unused = [c for c in free if c not in self.colors.values()]   # цвет, который ещё никому не давали
+            self.colors[key] = (unused or free or CIRCLES)[0]
+            save_colors(self.colors)
 
     # ---- bridges
     def unique_label(self, label: str, sid: str) -> str:
@@ -335,6 +370,7 @@ class Hub:
                     b.queue, back = ghost.queue, True
                 self.bridges[sid] = b
             b.last_seen = time.time()
+        self.pick_color(b.label)
         if back:
             self.send(sid, "снова на связи", kind="service")
         elif not quiet:
@@ -435,10 +471,12 @@ class Hub:
         чтобы было видно, что именно запустится."""
         rows, lines = [], []
         with self.lock:
+            b = self.bridges.get(sid)
+            prefix = f"{self.tag(b.label)} · " if b else ""      # чья кнопка, видно прямо на ней
             for btn in buttons[:5]:
                 key = secrets.token_hex(4)
                 self.cmd_buttons[key] = {"sid": sid, "command": btn["command"]}
-                rows.append([{"action": {"type": "text", "label": btn["label"][:40],
+                rows.append([{"action": {"type": "text", "label": (prefix + btn["label"])[:40],
                                          "payload": json.dumps({"cmd": key})}, "color": "primary"}])
                 lines.append(f"• {btn['label'][:40]} → ! {btn['command']}")
             while len(self.cmd_buttons) > 200:
@@ -453,7 +491,7 @@ class Hub:
             return self.say("Эта кнопка уже нажата или устарела.")
         if not b:
             return self.say("Сессия этой кнопки уже отключилась, команда не выполнена.")
-        self.deliver(b, "! " + btn["command"])
+        self.deliver(b, "! " + btn["command"], wake=True)   # агент сам просил нажать: будим его выводом
 
     def send(self, sid: str | None, text: str, kind: str = "reply", label: str | None = None,
              keyboard: dict | None = None, buttons: list[dict] | None = None) -> bool:
@@ -463,10 +501,10 @@ class Hub:
             label = b.label if b else None
         text = text.encode("utf-8", "replace").decode("utf-8")
         if kind == "service":
-            body, head = (f"{label} · {text}" if label else text), None
+            body, head = (f"{self.tag(label)} · {text}" if label else text), None
         else:
             body = text if kind == "output" else plain(text)   # вывод команды не переделываем
-            head = (f"‼️ ПРОБЛЕМА · {label}" if kind == "alert" else label) if label else \
+            head = (f"‼️ ПРОБЛЕМА · {self.tag(label)}" if kind == "alert" else self.tag(label)) if label else \
                    ("‼️ ПРОБЛЕМА" if kind == "alert" else None)
         if buttons and sid:
             keyboard, listing = self.command_keyboard(sid, buttons)
@@ -528,6 +566,15 @@ class Hub:
         if m:
             return self.cmd_off((m.group(1) or "").strip())
 
+        # «да» / «нет» без адреса, когда открыт ровно один вопрос о разрешении: ответ ему,
+        # даже если мостов несколько
+        if norm_cmd(text) in YES | NO and not (msg.get("reply_message") or {}) and not text.startswith("#"):
+            with self.lock:
+                open_keys = [k for k, a in self.asks.items() if not a["answer"]]
+            if len(open_keys) == 1:
+                self.ask_answer(open_keys[0], "yes" if norm_cmd(text) in YES else "no")
+                return
+
         target = self.route(msg, text)
         if isinstance(target, tuple) and isinstance(target[0], Bridge):
             self.deliver(*target, at=to_int(msg.get("date")) or None)
@@ -574,7 +621,7 @@ class Hub:
             self.pending[key] = text
             while len(self.pending) > 50:
                 self.pending.pop(next(iter(self.pending)))
-        rows = [[{"action": {"type": "text", "label": b.label[:40],
+        rows = [[{"action": {"type": "text", "label": self.tag(b.label)[:40],
                              "payload": json.dumps({"route": key, "sid": b.sid})},
                   "color": "secondary"}] for b in bs[:10]]
         lead = (note + " ") if note else ""
@@ -606,7 +653,7 @@ class Hub:
             return (bs[0], text)
         return "none" if not bs else "ask"
 
-    def deliver(self, b: Bridge, text: str, at: float | None = None):
+    def deliver(self, b: Bridge, text: str, at: float | None = None, wake: bool = False):
         if not text:
             return
         key = self.open_ask(b.sid)
@@ -623,7 +670,10 @@ class Hub:
         else:
             kind = "msg"
         # at это время отправки из ВК: мод не выполнит команду, пролежавшую слишком долго
-        b.push({"kind": kind, "text": text, "at": at or time.time()})
+        item = {"kind": kind, "text": text, "at": at or time.time()}
+        if wake and kind == "shell":
+            item["wake"] = True
+        b.push(item)
         log.info("deliver %s -> %s (%d симв.)", kind, b.label, len(text))
 
     def cmd_list(self):
@@ -631,7 +681,7 @@ class Hub:
             bs = list(self.bridges.values())
         if not bs:
             return self.say("Включённых мостов нет.")
-        lines = [f"{b.label} · {'занят' if b.busy else 'свободен'}" + (f" · {Path(b.cwd).name}" if b.cwd else "")
+        lines = [f"{self.tag(b.label)} · {'занят' if b.busy else 'свободен'}" + (f" · {Path(b.cwd).name}" if b.cwd else "")
                  for b in bs]
         self.say("Мосты\n" + "\n".join(lines))
 
@@ -704,6 +754,10 @@ def vk_call(method: str, params: dict, timeout: float = 30):
     raise RuntimeError(f"VK {method}: {last or 'retries exhausted'}")
 
 
+NO_KEYBOARD_NOTE = ("\n\n(Кнопки не показаны: ВК не даёт их без «Возможностей ботов». Включи в сообществе "
+                    "Управление → Сообщения → Настройки для бота. Пока отвечай словом или пиши «! команда».)")
+
+
 def vk_send(text: str, keyboard: dict | None = None) -> list[int] | None:
     """Sends one message to the owner. Returns its conversation_message_ids, None on failure."""
     if STUB:
@@ -718,8 +772,20 @@ def vk_send(text: str, keyboard: dict | None = None) -> list[int] | None:
     try:
         res = vk_call("messages.send", params)
     except Exception as e:
-        log.error("send failed: %s", e)
-        return None
+        if not keyboard or "error 912" not in str(e):
+            log.error("send failed: %s", e)
+            return None
+        # кнопки требуют «Возможностей ботов» в настройках сообщества: без них шлём текст,
+        # ответить можно словом, команду написать через «!»
+        log.warning("keyboard refused, sending without it: %s", e)
+        params.pop("keyboard")
+        params["random_id"] = random.randint(1, 2**31 - 1)
+        params["message"] = text + NO_KEYBOARD_NOTE
+        try:
+            res = vk_call("messages.send", params)
+        except Exception as e2:
+            log.error("send failed: %s", e2)
+            return None
     ids = []
     for item in res if isinstance(res, list) else []:
         if not isinstance(item, dict):

@@ -32,7 +32,7 @@ const SHELL_FRESH_S = 600 // команду, пролежавшую дольше
 
 type Saved = { enabled: boolean; label: string; rules: string; mode?: Mode; at?: number }
 type Kind = 'reply' | 'service' | 'alert' | 'output'
-type Item = { id: number; kind: string; text: string; at?: number }
+type Item = { id: number; kind: string; text: string; at?: number; wake?: boolean }
 type Injected = { turn: string; step: number; text: string; wasVk: boolean }
 
 let sid = ''
@@ -55,7 +55,6 @@ let lastSpawn = 0
 let lastRetry = 0
 let pending: string[] = []
 let acked = 0
-let noteSent = ''
 let hubKey: Uint8Array | undefined
 let hubUrl = ''
 let shellOn = false // хаб разрешил «! команда» (VK_SHELL=1 в .env)
@@ -275,7 +274,6 @@ async function rebind($: EngineInterface): Promise<void> {
   beforeHook.clear()
   injected = []
   pending = []
-  noteSent = ''
   lastHuman = undefined
   const saved = (await $.store.get('bridge:' + sid)) as Saved | undefined
   acked = ((await $.store.get('ack:' + sid)) as number | undefined) ?? 0
@@ -298,6 +296,7 @@ async function cleanStore($: EngineInterface): Promise<void> {
         await $.store.delete(key)
         await $.store.delete('ack:' + key.slice(7))
         await $.store.delete('held:' + key.slice(7))
+        await $.store.delete('note:' + key.slice(7))
       }
     }
   } catch {
@@ -317,7 +316,6 @@ async function enable($: EngineInterface, newLabel: string | undefined, newRules
     return 'Хаб не запустился. Проверь .env в папке vk-alert (VK_TOKEN, VK_GROUP_ID, VK_OWNER_ID) и data/hub.log.'
   }
   const ok = await registerBridge($, wasOn && registered)
-  noteSent = ''
   await save($)
   showStatus($)
   return ok ? `ВК-мост включён, метка «${label}», режим «${mode}».` : 'Мост включён, но хаб не принял регистрацию, попробую снова в фоне.'
@@ -353,16 +351,47 @@ function statusText(): string {
     : 'ВК-мост выключен.'
 }
 
-// Сообщение из ВК не проходит через собственный хук prompt.submit мода,
-// поэтому пояснение моста приклеиваем прямо к тексту, когда оно изменилось.
-function submit($: EngineInterface, text: string): void {
+// Пояснение моста модели. Отправляется, только когда изменилось; отметка в $.store, чтобы
+// перезагрузка мода не слала его заново. К тексту сообщений не клеится.
+async function pendingNote($: EngineInterface): Promise<{ note: string; hash: string } | undefined> {
   const note = contextNote()
-  const full = note !== noteSent ? `${text}\n\n<vk-bridge>\n${note}\n</vk-bridge>` : text
-  $.prompt.submit({ text: full, asUser: true }).then(
+  const hash = hex(await sha256(enc.encode(note)))
+  try {
+    if ((await $.store.get('note:' + sid)) === hash) return undefined
+  } catch {
+    // нет хранилища: отправим
+  }
+  return { note, hash }
+}
+
+async function noteSent($: EngineInterface, hash: string): Promise<void> {
+  try {
+    await $.store.set('note:' + sid, hash)
+  } catch {
+    // не критично
+  }
+}
+
+// Скрытая строка с пояснением перед сообщением из ВК: модель читает, человеку не видно.
+async function appendNote($: EngineInterface): Promise<void> {
+  const p = await pendingNote($)
+  if (!p) return
+  try {
+    const r = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: `<vk-bridge>\n${p.note}\n</vk-bridge>` }] } })
+    if (!r.deny) await noteSent($, p.hash)
+  } catch {
+    // попробуем со следующим сообщением
+  }
+}
+
+function submit($: EngineInterface, text: string): void {
+  void appendNote($).then(() => doSubmit($, text))
+}
+
+function doSubmit($: EngineInterface, text: string): void {
+  $.prompt.submit({ text, asUser: true }).then(
     res => {
-      const drop = (res as { drop?: string }).drop
-      if (drop) pending.push(text)
-      else noteSent = note
+      if ((res as { drop?: string }).drop) pending.push(text)
     },
     () => pending.push(text),
   )
@@ -465,15 +494,13 @@ async function notice($: EngineInterface, text: string): Promise<void> {
 async function inject($: EngineInterface, text: string): Promise<boolean> {
   const turn = currentTurn
   if (!turn) return false
-  const note = contextNote()
-  const body = MARK + text + (note !== noteSent ? `\n\n<vk-bridge>\n${note}\n</vk-bridge>` : '')
+  await appendNote($)
   try {
-    const r = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: body }] } })
+    const r = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: MARK + text }] } })
     if (r.deny) return false
   } catch {
     return false
   }
-  noteSent = note
   injected.push({ turn, step: stepSeq, text, wasVk: vkTurns.has(turn) })
   vkTurns.add(turn)
   lastHuman = 'vk'
@@ -545,13 +572,27 @@ async function runShell($: EngineInterface, item: Item): Promise<void> {
   }
   done = true
   run.seconds = Math.round((Date.now() - started) / 1000)
+  const report = shellReport(run)
+  if (!(await send($, report, 'output'))) await send($, report, 'reply')
+  if (item.wake && !busy) {
+    // кнопку прислал агент и ждёт результата: будим его выводом, как сообщением из ВК
+    submit($, shellRow(run) + '\nЭто команда с твоей кнопки. Продолжай работу с учётом вывода.')
+    return
+  }
+  // команда руками, как ! в терминале: агента не будим, вывод он прочтёт со следующим сообщением
+  // (если агент сейчас работает, прочтёт на следующем шаге)
+  const turn = currentTurn
   try {
     await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: shellRow(run) }] } })
   } catch (err) {
     $.ui.log('вывод команды не попал в разговор: ' + String(err))
   }
-  const report = shellReport(run)
-  if (!(await send($, report, 'output'))) await send($, report, 'reply')
+  if (item.wake && busy && turn) {
+    // кнопка, а агент занят: если ход кончится раньше, чем он прочтёт вывод, разбудим после хода
+    injected.push({ turn, step: stepSeq, text: shellRow(run).slice(MARK.length) + '\nЭто команда с твоей кнопки. Продолжай работу с учётом вывода.', wasVk: vkTurns.has(turn) })
+    vkTurns.add(turn)
+    lastHuman = 'vk'
+  }
 }
 
 async function tick($: EngineInterface): Promise<void> {
@@ -708,7 +749,11 @@ export const register: Register = on => {
   })
 
   on('session.compact', async ($, e, next) => {
-    noteSent = '' // после сжатия пояснение моста нужно дать заново
+    try {
+      await $.store.delete('note:' + sid) // после сжатия пояснение нужно дать заново
+    } catch {
+      // не критично
+    }
     return next(e)
   })
 
@@ -757,6 +802,7 @@ export const register: Register = on => {
     if (!enabled) return { result: 'ВК-мост выключен, сообщение не отправлено.' }
     if (!text.trim()) return { result: 'Пустой текст, ничего не отправлено.' }
     const buttons = commandButtons(input.buttons)
+    if (buttons.length && !shellOn) await registerBridge($, true) // сразу после перезагрузки мода флаг ещё не получен
     if (buttons.length && !shellOn) {
       return { result: 'Не отправлено: команды с телефона выключены (VK_SHELL), кнопки с командами недоступны. Отправь без buttons.' }
     }
@@ -813,10 +859,10 @@ export const register: Register = on => {
     if (e.origin.kind === 'composer') lastHuman = 'local'
     if (e.turnId === undefined) lastOrigin = e.origin.kind
     if (!enabled) return next(e)
-    const note = contextNote()
-    if (note === noteSent) return next(e)
-    const r = await next({ ...e, context: [...(e.context ?? []), note] })
-    if (!('drop' in r)) noteSent = note
+    const p = await pendingNote($)
+    if (!p) return next(e)
+    const r = await next({ ...e, context: [...(e.context ?? []), p.note] })
+    if (!('drop' in r && r.drop)) await noteSent($, p.hash)
     return r
   })
 

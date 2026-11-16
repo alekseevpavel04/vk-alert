@@ -34,8 +34,25 @@ def call(path, body=None):
     return hub.signed_request(path, body)
 
 
-def out(since=0):
+def no_circles(text):
+    for c in hub.CIRCLES:
+        text = text.replace(c + " ", "")
+    return text
+
+
+def raw_out(since=0):
     return call(f"/stub/out?since={since}")[1]["messages"]
+
+
+def out(since=0):
+    """Отправленное без цветных кружков, чтобы проверки текста не зависели от цвета."""
+    msgs = raw_out(since)
+    for m in msgs:
+        m["text"] = no_circles(m["text"])
+        for row in (m.get("keyboard") or {}).get("buttons", []):
+            for btn in row:
+                btn["action"]["label"] = no_circles(btn["action"]["label"])
+    return msgs
 
 
 ACKS = {}
@@ -96,6 +113,21 @@ def unit_tests():
     hub.HUB.deliver(b, "! rm -rf build")
     hub.SHELL, hub.STUB = True, False
     check("VK_SHELL выключен: команда не доставлена", not b.queue and "выключены" in hub.HUB.stub_out[-1]["text"])
+    # VK refuses keyboards without the bot feature (error 912): the text still goes
+    sent = []
+
+    def fake_call(method, params, timeout=30):
+        if "keyboard" in params:
+            raise RuntimeError("VK messages.send error 912: This is a chat bot feature")
+        sent.append(params["message"])
+        return [{"peer_id": 1, "conversation_message_id": 7}]
+    real_call, hub.vk_call = hub.vk_call, fake_call
+    try:
+        ids = hub.vk_send("Нажми кнопку", {"inline": True, "buttons": []})
+    finally:
+        hub.vk_call = real_call
+    check("ошибка 912: сообщение уходит без кнопок с подсказкой",
+          ids == [7] and sent and sent[0].startswith("Нажми кнопку") and "Возможностей ботов" in sent[0], sent)
 
 
 def live_tests():
@@ -141,7 +173,7 @@ def live_tests():
         say("! git status", date=1700000000)
         m = inbox("s1")["messages"][0]
         check("! команда уходит как shell со временем отправки",
-              m["kind"] == "shell" and m["text"] == "! git status" and m["at"] == 1700000000, m)
+              m["kind"] == "shell" and m["text"] == "! git status" and m["at"] == 1700000000 and "wake" not in m, m)
         say("!!! срочно глянь")
         check("!!! это обычное сообщение", inbox("s1")["messages"][0]["kind"] == "msg")
         say("#shop ! ls")
@@ -170,18 +202,24 @@ def live_tests():
               and last() == "shopper · вопрос закрыт в терминале", last())
         say("да")
         check("«да» без открытого вопроса идёт агенту", inbox("s1")["messages"][0]["text"] == "да")
+        call("/bridge/on", {"sid": "s9", "label": "other", "quiet": True})
+        _, a4 = call("/ask", {"sid": "s9", "text": "вопрос второй сессии"})
+        say("да")
+        check("два моста, один открытый вопрос: «да» без адреса уходит ему",
+              call(f"/ask?id={a4['id']}&wait=0")[1]["answer"] == "yes" and last() == "other · разрешил", last())
+        call("/bridge/off", {"sid": "s9"})
 
         # command buttons from the agent: shown as text, run once
         call("/send", {"sid": "s1", "text": "Запусти выгрузку", "buttons": [
             {"label": "Выгрузить", "command": "python up.py --all *.bin"}, {"command": "git status"}]})
         m = out()[-1]
         labels = [r[0]["action"]["label"] for r in m["keyboard"]["buttons"]]
-        check("кнопки с командами и их текст", labels == ["Выгрузить", "git status"]
+        check("кнопки с командами и их текст", labels == ["shopper · Выгрузить", "shopper · git status"]
               and m["text"].endswith("Кнопки\n• Выгрузить → ! python up.py --all *.bin\n• git status → ! git status"), m)
         p = m["keyboard"]["buttons"][0][0]["action"]["payload"]
         say("Выгрузить", payload=p)
         it = inbox("s1")["messages"][0]
-        check("нажатие запускает команду", it["kind"] == "shell" and it["text"] == "! python up.py --all *.bin", it)
+        check("нажатие запускает команду", it["kind"] == "shell" and it["text"] == "! python up.py --all *.bin" and it.get("wake") is True, it)
         say("Выгрузить", payload=p)
         check("второе нажатие не запускает", "уже нажата" in last() and not inbox("s1")["messages"], last())
 
@@ -201,6 +239,15 @@ def live_tests():
 
         call("/bridge/on", {"sid": "s2", "label": "shopper", "quiet": True})
         check("дубль метки", call("/health")[1]["bridges"][1]["label"] == "shopper-2")
+        # a circle per agent: different for two live bridges, in headers and on buttons
+        call("/send", {"sid": "s1", "text": "раз"})
+        c1 = raw_out()[-1]["text"].split(" ", 1)[0]
+        call("/send", {"sid": "s2", "text": "два"})
+        c2 = raw_out()[-1]["text"].split(" ", 1)[0]
+        check("у двух агентов разные кружки", c1 in hub.CIRCLES and c2 in hub.CIRCLES and c1 != c2, (c1, c2))
+        call("/send", {"sid": "s1", "text": "кнопка", "buttons": [{"label": "Пуск", "command": "ls"}]})
+        lab = raw_out()[-1]["keyboard"]["buttons"][0][0]["action"]["label"]
+        check("кружок и метка на кнопке", lab == f"{c1} shopper · Пуск", lab)
         call("/bridge/on", {"sid": "s2", "label": "ltt 2", "quiet": True})
 
         say("ещё", reply_to=a_msg)
