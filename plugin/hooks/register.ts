@@ -2,7 +2,8 @@ import type { Register, EngineInterface } from 'claude-code'
 import {
   decide,
   finalAnswer,
-  isNow,
+  forceText,
+  joinMessages,
   MARK,
   MODES,
   oneLine,
@@ -25,7 +26,6 @@ import { enc, hex, hmacHex, sha256 } from './crypto.js'
 const TOOL_BRIDGE = 'mcp__vk-bridge__vk_bridge'
 const TOOL_SEND = 'mcp__vk-bridge__vk_send'
 const LABEL_MAX = 16
-const ACK_AFTER_MS = 90_000 // молчит дольше, значит владельцу пора узнать, что сообщение взято
 const SHELL_TIMEOUT_MS = 600_000 // больше не даёт $.process.run
 const SHELL_NOTE_MS = 15_000
 const SHELL_FRESH_S = 600 // команду, пролежавшую дольше (компьютер спал, сессия была закрыта), не выполняем
@@ -64,8 +64,7 @@ let stepSeq = 0 // шаги главного цикла: шаг после вс�
 let injected: Injected[] = []
 const beforeHook = new Map<string, string>() // ответ хода до обратной связи Stop-хука
 let askReason = '' // почему движок спрашивает разрешение (текст guard-хука), для вопроса в ВК
-let ackDue = 0 // когда сказать «взял в работу», если агент молчит
-let toldTurn: string | undefined // ход, в котором владелец уже что-то получил
+let held: string[] = [] // сообщения, пришедшие, пока агент занят: уйдут одним промптом после хода
 
 // ---------------------------------------------------------------- helpers
 
@@ -83,12 +82,16 @@ function contextNote(): string {
   return [
     `ВК-мост включён для этой сессии, метка «${label}». Владелец моста может быть не у компьютера и читает ответы в ВК.`,
     `Сообщения, которые начинаются с «${MARK.trim()}», владелец прислал из ВК. Итоговый ответ хода, начатого таким сообщением, уйдёт ему в ВК автоматически, пиши его коротко и по делу, без таблиц.`,
+    'Формат сообщений в ВК по умолчанию, если правила отчёта владельца не говорят иначе. Первая строка «tl;dr: …», 4-10 слов, статус работы или суть ответа (или то, что владелец просил присылать). Дальше подробности как обычно.',
     'Владелец ждёт ответа на каждое своё сообщение, иначе не знает, дошло ли оно. Если работа по сообщению займёт больше пары минут, сначала коротко ответь через vk_send (что понял, что делаешь, когда ждать итог), потом работай.',
-    'Сообщение из ВК может прийти посреди хода, если владелец начал его словом «сразу». Ответь на него через vk_send, не дожидаясь конца работы.',
+    'Сообщения, пришедшие, пока ты работал, приходят одним промптом после хода. Если владелец написал «force send», они приходят посреди хода. Тогда ответь на них через vk_send, не дожидаясь конца работы.',
     `Режим автоотправки «${mode}»: ${MODES[mode]}. Ходы, начатые с клавиатуры, в ВК не уходят. Если Stop-хук вернул тебя к работе, в ВК уйдёт ответ до его обратной связи. Ответ самому хуку владельцу не пересылай, через vk_send отправляй только то, что меняет для него картину.`,
     'Промежуточные сообщения (статус, вопрос, просьба принять решение) отправляй инструментом vk_send. level alert ставь только при реальной проблеме, когда без владельца нельзя продолжать или есть риск потерять данные, деньги или доступ. Всё остальное обычным уровнем.',
     ...(shellOn
-      ? ['Владелец может выполнить команду с телефона, написав «! команда». Она идёт в bash в папке сессии, вывод появится в разговоре, как после ! в терминале. Если просишь владельца что-то запустить, пиши команду одной строкой, начиная с «! », чтобы её можно было скопировать.']
+      ? [
+          'Владелец может выполнить команду с телефона, написав «! команда». Она идёт в bash в папке сессии, вывод появится в разговоре, как после ! в терминале.',
+          'Если просишь владельца что-то запустить, не заставляй его переписывать команду. Передай её в vk_send в поле buttons ({label, command}): в ВК появится кнопка, нажатие выполнит команду так же, как «! команда». Команда целиком, одной строкой, без «!». Кнопка срабатывает один раз.',
+        ]
       : []),
     'AskUserQuestion при включённом мосте не работает. Вопрос задавай через vk_send с пронумерованными вариантами и заканчивай ход, ответ придёт сообщением из ВК.',
     'Сменить метку, правила отчёта, режим или выключить мост можно инструментом vk_bridge. Если правила ограничивают сообщения (например «только при проблемах»), поставь режим quiet.',
@@ -214,10 +217,25 @@ async function registerBridge($: EngineInterface, quiet: boolean): Promise<boole
   return false
 }
 
-async function send($: EngineInterface, text: string, kind: Kind = 'reply'): Promise<boolean> {
+type Button = { label: string; command: string }
+
+function commandButtons(value: unknown): Button[] {
+  if (!Array.isArray(value)) return []
+  const out: Button[] = []
+  for (const v of value.slice(0, 5)) {
+    const b = v as { label?: unknown; command?: unknown }
+    const command = typeof b?.command === 'string' ? b.command.trim().replace(/^!\s*/, '') : ''
+    if (!command) continue
+    const label = typeof b.label === 'string' && b.label.trim() ? b.label.trim() : command
+    out.push({ label: oneLine(label, 40), command })
+  }
+  return out
+}
+
+async function send($: EngineInterface, text: string, kind: Kind = 'reply', buttons: Button[] = []): Promise<boolean> {
   if (!enabled || !text.trim()) return false
   try {
-    const r = await hubFetch($, '/send', { sid, text, kind })
+    const r = await hubFetch($, '/send', buttons.length ? { sid, text, kind, buttons } : { sid, text, kind })
     if (r.known === false) registered = false
     return !!r.ok
   } catch {
@@ -261,6 +279,7 @@ async function rebind($: EngineInterface): Promise<void> {
   lastHuman = undefined
   const saved = (await $.store.get('bridge:' + sid)) as Saved | undefined
   acked = ((await $.store.get('ack:' + sid)) as number | undefined) ?? 0
+  held = ((await $.store.get('held:' + sid)) as string[] | undefined) ?? []
   label = saved?.label || shortLabel(baseName(cwd))
   rules = saved?.rules || ''
   mode = saved?.mode ?? 'answers'
@@ -278,6 +297,7 @@ async function cleanStore($: EngineInterface): Promise<void> {
       if (v && !v.enabled && (v.at ?? 0) < month) {
         await $.store.delete(key)
         await $.store.delete('ack:' + key.slice(7))
+        await $.store.delete('held:' + key.slice(7))
       }
     }
   } catch {
@@ -348,7 +368,49 @@ function submit($: EngineInterface, text: string): void {
   )
 }
 
-async function handle($: EngineInterface, item: Item, batchStart: boolean): Promise<void> {
+async function saveHeld($: EngineInterface): Promise<void> {
+  try {
+    await $.store.set('held:' + sid, held)
+  } catch {
+    // не критично: потеряется только при перезагрузке мода
+  }
+}
+
+// Тексты из ВК одной пачкой. Пока агент занят, копим и отдаём одним промптом после хода.
+// «force send» отдаёт накопленное вместе с этим текстом в идущий ход.
+async function takeTexts($: EngineInterface, texts: readonly string[]): Promise<void> {
+  if (!texts.length) return
+  let force = false
+  const clean: string[] = []
+  for (const t of texts) {
+    const f = forceText(t)
+    if (f === undefined) clean.push(t)
+    else {
+      force = true
+      if (f) clean.push(f)
+    }
+  }
+  if (busy && !force) {
+    held.push(...clean)
+    await saveHeld($)
+    if (!busyNoted && Date.now() - turnStartedAt > 5000) {
+      busyNoted = true
+      await send($, 'занят, прочитаю после текущего хода. Чтобы передать сейчас, напиши force send', 'service')
+    }
+    return
+  }
+  const all = joinMessages([...held, ...clean])
+  held = []
+  await saveHeld($)
+  if (!all) {
+    await send($, 'передавать нечего', 'service')
+    return
+  }
+  if (busy && (await inject($, all))) return
+  submit($, MARK + all)
+}
+
+async function handle($: EngineInterface, item: Item): Promise<string | undefined> {
   if (item.kind === 'off') {
     await disable($, 'мост выключен с телефона', true)
     $.ui.toast('ВК-мост выключен с телефона')
@@ -374,13 +436,7 @@ async function handle($: EngineInterface, item: Item, batchStart: boolean): Prom
     void runShell($, item) // не ждём: опрос хаба и «стоп» не должны стоять, пока идёт команда
     return
   }
-  if (busy && isNow(item.text) && (await inject($, item.text))) return
-  // «занят» только если идёт уже начатый ход, а не тот, что запустило соседнее сообщение из этой же пачки
-  if (busy && batchStart && !busyNoted && Date.now() - turnStartedAt > 5000) {
-    busyNoted = true
-    await send($, 'занят, прочитаю после текущего хода. Срочное начни словом «сразу»', 'service')
-  }
-  submit($, MARK + item.text)
+  return item.text
 }
 
 function permissionText(tool: string, input: unknown, reason: string): string {
@@ -405,7 +461,7 @@ async function notice($: EngineInterface, text: string): Promise<void> {
   }
 }
 
-// «сразу ...»: строка в разговор, которую модель прочтёт на следующем шаге текущего хода.
+// «force send»: строка в разговор, которую модель прочтёт на следующем шаге текущего хода.
 async function inject($: EngineInterface, text: string): Promise<boolean> {
   const turn = currentTurn
   if (!turn) return false
@@ -421,8 +477,7 @@ async function inject($: EngineInterface, text: string): Promise<boolean> {
   injected.push({ turn, step: stepSeq, text, wasVk: vkTurns.has(turn) })
   vkTurns.add(turn)
   lastHuman = 'vk'
-  toldTurn = turn
-  await notice($, `ВК, сразу: ${oneLine(text, 300)}`)
+  await notice($, `ВК, force send: ${oneLine(text, 300)}`)
   await send($, 'передал в текущий ход', 'service')
   return true
 }
@@ -515,6 +570,13 @@ async function tick($: EngineInterface): Promise<void> {
       pending = []
       for (const t of retry) submit($, t)
     }
+    if (!busy && held.length) {
+      // накопленное осталось после перезагрузки мода, а агент уже свободен
+      const t = joinMessages(held)
+      held = []
+      await saveHeld($)
+      if (t) submit($, MARK + t)
+    }
     const data = await hubFetch($, `/inbox?sid=${encodeURIComponent(sid)}&wait=20&busy=${busy ? 1 : 0}&ack=${acked}`)
     if (data.status !== 200) return
     if (!data.known) {
@@ -523,18 +585,20 @@ async function tick($: EngineInterface): Promise<void> {
     }
     const stored = ((await $.store.get('ack:' + sid)) as number | undefined) ?? 0
     acked = Math.max(acked, stored)
-    let first = true
+    const texts: string[] = []
     for (const item of data.messages as Item[]) {
       if (!enabled) break
       if (item.id <= acked) continue
       acked = item.id
-      try {
-        await $.store.set('ack:' + sid, acked)
-      } catch (err) {
-        $.ui.log('подтверждение не сохранено: ' + String(err))
-      }
-      await handle($, item, first)
-      first = false
+      const text = await handle($, item)
+      if (text) texts.push(text)
+    }
+    // накопленное сохраняем раньше подтверждения, чтобы перезагрузка мода ничего не потеряла
+    if (enabled) await takeTexts($, texts)
+    try {
+      await $.store.set('ack:' + sid, acked)
+    } catch (err) {
+      $.ui.log('подтверждение не сохранено: ' + String(err))
     }
   } catch {
     registered = false
@@ -581,12 +645,27 @@ export const register: Register = on => {
         'Отправляет владельцу моста сообщение в ВК от имени этой сессии, когда ВК-мост включён. ' +
         'Для промежуточного статуса, вопроса или просьбы принять решение. Итоговый ответ хода, начатого из ВК, уходит сам, его дублировать не надо. ' +
         'Пиши коротко, обычным текстом. level alert делает сообщение заметным (‼️ ПРОБЛЕМА): только когда без владельца нельзя продолжать ' +
-        'или есть риск потерять данные, деньги или доступ. Обычные отчёты, вопросы по ходу работы и «готово» отправляй с level info.',
+        'или есть риск потерять данные, деньги или доступ. Обычные отчёты, вопросы по ходу работы и «готово» отправляй с level info. ' +
+        'buttons добавляет под сообщением кнопки с командами (если владелец разрешил команды с телефона): нажатие выполняет команду ' +
+        'в bash в папке сессии, как «! команда», вывод придёт владельцу и тебе. Так проси владельца запустить то, что тебе запускать нельзя.',
       inputSchema: {
         type: 'object',
         properties: {
           text: { type: 'string', description: 'Текст сообщения' },
           level: { type: 'string', enum: ['info', 'alert'], description: 'info обычное, alert реальная проблема' },
+          buttons: {
+            type: 'array',
+            maxItems: 5,
+            description: 'Кнопки с командами, до 5. Каждая срабатывает один раз',
+            items: {
+              type: 'object',
+              properties: {
+                label: { type: 'string', description: 'Надпись на кнопке, до 40 символов' },
+                command: { type: 'string', description: 'Команда целиком, одной строкой, без «!»' },
+              },
+              required: ['command'],
+            },
+          },
         },
         required: ['text'],
       },
@@ -604,12 +683,6 @@ export const register: Register = on => {
     }
 
     $.clock.every(1000, () => {
-      // агент давно молчит над сообщением из ВК: говорим владельцу, что оно взято в работу
-      if (enabled && busy && currentTurn && ackDue && Date.now() > ackDue && toldTurn !== currentTurn) {
-        ackDue = 0
-        toldTurn = currentTurn
-        void send($, 'взял в работу, итог пришлю, когда закончу', 'service')
-      }
       void tick($)
     })
     void cleanStore($)
@@ -679,13 +752,16 @@ export const register: Register = on => {
   }).catch(() => ({ result: 'Ошибка ВК-моста, попробуй ещё раз или /vk status.' }))
 
   on('tool.call', { tool: TOOL_SEND }, async ($, e) => {
-    const input = e as unknown as { text?: unknown; level?: unknown }
+    const input = e as unknown as { text?: unknown; level?: unknown; buttons?: unknown }
     const text = typeof input.text === 'string' ? input.text : ''
     if (!enabled) return { result: 'ВК-мост выключен, сообщение не отправлено.' }
     if (!text.trim()) return { result: 'Пустой текст, ничего не отправлено.' }
-    const ok = await send($, text, input.level === 'alert' ? 'alert' : 'reply')
-    if (ok && currentTurn) toldTurn = currentTurn
-    return { result: ok ? 'Отправлено в ВК.' : 'Не отправлено: хаб или ВК недоступны.' }
+    const buttons = commandButtons(input.buttons)
+    if (buttons.length && !shellOn) {
+      return { result: 'Не отправлено: команды с телефона выключены (VK_SHELL), кнопки с командами недоступны. Отправь без buttons.' }
+    }
+    const ok = await send($, text, input.level === 'alert' ? 'alert' : 'reply', buttons)
+    return { result: ok ? 'Отправлено в ВК' + (buttons.length ? `, кнопок ${buttons.length}.` : '.') : 'Не отправлено: хаб или ВК недоступны.' }
   }).catch(() => ({ result: 'Ошибка ВК-моста, сообщение не отправлено.' }))
 
   // Запоминаем, почему вызов требует разрешения: guard-хук проекта объясняет это в reason.
@@ -709,7 +785,6 @@ export const register: Register = on => {
       return r
     }
     if (!id) return r
-    if (currentTurn) toldTurn = currentTurn
     while (!next.signal.aborted) {
       let answer = ''
       try {
@@ -754,13 +829,12 @@ export const register: Register = on => {
       const d = decide(e.text, lastOrigin, mode, lastHuman)
       lastHuman = d.lastHuman
       if (d.forward) vkTurns.add(e.turnId)
-      ackDue = e.text.startsWith(MARK) ? Date.now() + ACK_AFTER_MS : 0
       lastOrigin = undefined
     }
     return next(e)
   })
 
-  // Считаем шаги главного цикла: шаг, начатый после «сразу», значит, что модель прочла вставку.
+  // Считаем шаги главного цикла: шаг, начатый после force send, значит, что модель прочла вставку.
   on('turn.step', async function* ($, e, next) {
     if (e.agentId === undefined) stepSeq++
     return yield* next(e)
@@ -783,8 +857,7 @@ export const register: Register = on => {
     if (e.agentId === undefined) {
       busy = false
       currentTurn = undefined
-      ackDue = 0
-      // «сразу», вставленное, когда модель уже писала последний ответ: она его не прочла
+      // force send, вставленный, когда модель уже писала последний ответ: она его не прочла
       const mine = injected.filter(x => x.turn === e.turnId)
       injected = injected.filter(x => x.turn !== e.turnId)
       const missed = mine.filter(x => x.step === stepSeq)
@@ -801,7 +874,13 @@ export const register: Register = on => {
         else void send($, 'готово', 'service')
       }
       stoppedByVk = undefined
-      for (const m of missed) submit($, MARK + m.text)
+      // всё, что пришло за ход (и непрочитанный force send), одним промптом
+      const rest = joinMessages([...missed.map(m => m.text), ...held])
+      if (held.length) {
+        held = []
+        void saveHeld($)
+      }
+      if (rest && enabled) submit($, MARK + rest)
     }
     return r
   })

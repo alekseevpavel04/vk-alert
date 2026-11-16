@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { decide, finalAnswer, isNow, shellCommand, shellReport, shellRow } from '../hooks/forward.js'
+import { decide, finalAnswer, forceText, joinMessages, shellCommand, shellReport, shellRow } from '../hooks/forward.js'
 
 const VK = '[ВК] сделай X'
 
@@ -48,11 +48,21 @@ test('после Stop-хука в ВК уходит ответ до его об�
 
 const NL = String.fromCharCode(10)
 
-test('«сразу» в начале передаёт сообщение в идущий ход', async () => {
-  for (const t of ['сразу как дела', 'Сразу, как дела', 'СРАЗУ: стоп после шага', 'сразу' + NL + 'проверь лог']) {
-    expect(isNow(t)).toBe(true)
+test('force send в начале, текст после него без пометки', async () => {
+  expect(forceText('force send как дела')).toBe('как дела')
+  expect(forceText('Force Send, как дела')).toBe('как дела')
+  expect(forceText('forcesend')).toBe('')
+  expect(forceText('force send')).toBe('')
+  expect(forceText('force send' + NL + 'проверь лог')).toBe('проверь лог')
+  for (const t of ['как дела', 'force', 'please force send', 'force sender x', 'сразу как дела']) {
+    expect(forceText(t)).toBe(undefined)
   }
-  for (const t of ['сразу', 'сразу!', 'сразуже', 'как дела сразу', 'не сразу']) expect(isNow(t)).toBe(false)
+})
+
+test('накопленные сообщения уходят одним текстом', async () => {
+  expect(joinMessages(['доложи статус', ' ', 'и сколько стоит'])).toBe('доложи статус' + NL + NL + 'и сколько стоит')
+  expect(joinMessages(['одно'])).toBe('одно')
+  expect(joinMessages([])).toBe('')
 })
 
 test('«! команда» распознаётся, «!!» и «!» без текста нет', async () => {

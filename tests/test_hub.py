@@ -171,6 +171,20 @@ def live_tests():
         say("да")
         check("«да» без открытого вопроса идёт агенту", inbox("s1")["messages"][0]["text"] == "да")
 
+        # command buttons from the agent: shown as text, run once
+        call("/send", {"sid": "s1", "text": "Запусти выгрузку", "buttons": [
+            {"label": "Выгрузить", "command": "python up.py --all *.bin"}, {"command": "git status"}]})
+        m = out()[-1]
+        labels = [r[0]["action"]["label"] for r in m["keyboard"]["buttons"]]
+        check("кнопки с командами и их текст", labels == ["Выгрузить", "git status"]
+              and m["text"].endswith("Кнопки\n• Выгрузить → ! python up.py --all *.bin\n• git status → ! git status"), m)
+        p = m["keyboard"]["buttons"][0][0]["action"]["payload"]
+        say("Выгрузить", payload=p)
+        it = inbox("s1")["messages"][0]
+        check("нажатие запускает команду", it["kind"] == "shell" and it["text"] == "! python up.py --all *.bin", it)
+        say("Выгрузить", payload=p)
+        check("второе нажатие не запускает", "уже нажата" in last() and not inbox("s1")["messages"], last())
+
         # command output is sent as is, without the markdown rewrite
         call("/send", {"sid": "s1", "text": "| a | b |\n**x** token=abcdef123456", "kind": "output"})
         check("вывод команды без переделки, секрет скрыт",

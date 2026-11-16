@@ -48,10 +48,19 @@ export function finalAnswer(beforeHook: string | undefined, answer: string): str
   return beforeHook?.trim() ? beforeHook : answer
 }
 
-/** «сразу ...» передаёт сообщение в идущий ход, а не после него. */
-export function isNow(text: string): boolean {
-  const t = text.trim()
-  return /^сразу(?=[\s,.:;!?-]|$)/iu.test(t) && t.replace(/^сразу[\s,.:;!?-]*/iu, '') !== ''
+/**
+ * «force send ...» передаёт накопленное и этот текст в идущий ход, а не после него.
+ * Возвращает текст без пометки (может быть пустым) или undefined, если пометки нет.
+ */
+export function forceText(text: string): string | undefined {
+  const m = /^\s*force\s*send\b[\s,.:;!-]*([\s\S]*)$/i.exec(text)
+  return m ? m[1]!.trim() : undefined
+}
+
+/** Сообщения, пришедшие, пока агент был занят, уходят ему одним промптом. */
+export function joinMessages(texts: readonly string[]): string {
+  const t = texts.map(s => s.trim()).filter(Boolean)
+  return t.length <= 1 ? (t[0] ?? '') : t.join('\n\n')
 }
 
 /** Команда из «! команда», пустая строка, если это не команда. «!!» и «!» без текста не команды. */

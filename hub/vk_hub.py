@@ -306,6 +306,7 @@ class Hub:
         self.pending: dict[str, str] = {}          # route key -> text awaiting "кому?"
         self.asks: dict[str, dict] = {}            # ask id -> {"sid", "answer"}: агент ждёт «да» или «нет»
         self.ask_cond = threading.Condition(self.lock)
+        self.cmd_buttons: dict[str, dict] = {}     # key -> {"sid", "command"}: кнопка с командой агента
         self.stub_out: list[dict] = []
         self.no_bridges_since = time.time()
         self.started = time.time()
@@ -429,8 +430,33 @@ class Hub:
         return pref[0] if len(pref) == 1 else None
 
     # ---- outgoing
+    def command_keyboard(self, sid: str, buttons: list[dict]) -> tuple[dict, str]:
+        """Кнопки с командами агента: нажатие выполняет команду один раз. Команды пишем и текстом,
+        чтобы было видно, что именно запустится."""
+        rows, lines = [], []
+        with self.lock:
+            for btn in buttons[:5]:
+                key = secrets.token_hex(4)
+                self.cmd_buttons[key] = {"sid": sid, "command": btn["command"]}
+                rows.append([{"action": {"type": "text", "label": btn["label"][:40],
+                                         "payload": json.dumps({"cmd": key})}, "color": "primary"}])
+                lines.append(f"• {btn['label'][:40]} → ! {btn['command']}")
+            while len(self.cmd_buttons) > 200:
+                self.cmd_buttons.pop(next(iter(self.cmd_buttons)))
+        return {"inline": True, "buttons": rows}, "\n\nКнопки\n" + "\n".join(lines)
+
+    def on_command_button(self, key: str):
+        with self.lock:
+            btn = self.cmd_buttons.pop(key, None)
+            b = self.bridges.get(btn["sid"]) if btn else None
+        if not btn:
+            return self.say("Эта кнопка уже нажата или устарела.")
+        if not b:
+            return self.say("Сессия этой кнопки уже отключилась, команда не выполнена.")
+        self.deliver(b, "! " + btn["command"])
+
     def send(self, sid: str | None, text: str, kind: str = "reply", label: str | None = None,
-             keyboard: dict | None = None) -> bool:
+             keyboard: dict | None = None, buttons: list[dict] | None = None) -> bool:
         if sid and not label:
             with self.lock:
                 b = self.bridges.get(sid)
@@ -442,6 +468,9 @@ class Hub:
             body = text if kind == "output" else plain(text)   # вывод команды не переделываем
             head = (f"‼️ ПРОБЛЕМА · {label}" if kind == "alert" else label) if label else \
                    ("‼️ ПРОБЛЕМА" if kind == "alert" else None)
+        if buttons and sid:
+            keyboard, listing = self.command_keyboard(sid, buttons)
+            body += listing
         body = redact(body)
         parts = chunks(body, MAX_UNITS - 60)
         n = len(parts)
@@ -473,6 +502,8 @@ class Hub:
 
         if payload.get("route"):                    # a "кому?" button press
             return self.on_route_button(payload)
+        if payload.get("cmd"):                      # кнопка с командой под сообщением агента
+            return self.on_command_button(str(payload["cmd"]))
         if payload.get("ask"):                      # «Да» / «Нет» под вопросом агента
             if not self.ask_answer(str(payload["ask"]), "yes" if payload.get("v") == "yes" else "no"):
                 self.say("Этот вопрос уже закрыт.")
@@ -625,7 +656,8 @@ class Hub:
             "• включён один мост, просто пиши\n"
             "• несколько, отвечай на сообщение агента или начни с #метка\n"
             "• стоп, прервать работу агента\n"
-            "• сразу ..., передать агенту посреди работы, не дожидаясь конца хода\n"
+            "• пока агент занят, сообщения копятся и уходят ему одним текстом после хода\n"
+            "• force send, отдать накопленное агенту сейчас, посреди работы\n"
             "• ! команда, выполнить команду в папке сессии (если включено VK_SHELL=1)\n"
             "• /list, какие мосты включены\n"
             "• /off метка или /off all, выключить мост")
@@ -894,7 +926,11 @@ class Handler(BaseHTTPRequestHandler):
             if sid and not known:
                 return self._json(200, {"ok": False, "known": False})
             label = norm_label(str(d["label"])) if d.get("label") and not sid else None
-            ok = HUB.send(sid or None, text, kind=kind, label=label)
+            buttons = [{"label": str(b.get("label") or b.get("command")).strip(), "command": str(b.get("command")).strip()}
+                       for b in (d.get("buttons") or []) if isinstance(b, dict) and str(b.get("command") or "").strip()]
+            if buttons and not SHELL:
+                return self._json(400, {"error": "command buttons need VK_SHELL=1"})
+            ok = HUB.send(sid or None, text, kind=kind, label=label, buttons=buttons or None)
             return self._json(200 if ok else 502, {"ok": ok})
         if p == "/stub/in" and STUB:
             msg = {"from_id": OWNER_ID, "peer_id": OWNER_ID, "text": str(d.get("text") or ""),
